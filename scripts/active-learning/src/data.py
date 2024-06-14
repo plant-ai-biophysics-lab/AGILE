@@ -7,6 +7,7 @@ import lightning as pl
 from torchvision.datasets import MNIST
 from torch.utils.data import DataLoader
 
+### MNIST DATASET ###
 class MNISTDataModule(pl.LightningDataModule):
     def __init__(
         self, 
@@ -19,6 +20,8 @@ class MNISTDataModule(pl.LightningDataModule):
         User can download the dataset by using 
 
         Args:
+            train_dataset (torchvision.datasets): Training dataset.
+            test_dataset (torchvision.datasets): Testing dataset.
             root_dir (str): Root directory of the MNIST dataset.
             batch_size (int, optional): Number of samples per batch. Defaults to 32.
         """

@@ -4,6 +4,7 @@ import lightning as pl
 import torch.nn.functional as F
 
 from torch import nn
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
 
 ### SIMPLE CLASSIFIER ###
 class LitClassifierModel(pl.LightningModule):
@@ -49,16 +50,6 @@ class LitClassifierModel(pl.LightningModule):
         self.log('train_acc', acc, on_step=True, on_epoch=True, logger=True)
         return {'loss': loss, 'acc': acc}
     
-    def validation_step(self, batch):
-        x, y = batch
-        logits = self(x)
-        loss = F.cross_entropy(logits, y)
-        acc = self.accuracy(logits, y)
-        
-        self.log('val_loss', loss, prog_bar=True)
-        self.log('val_acc', acc, prog_bar=True)
-        return {'val_loss': loss, 'val_acc': acc}
-    
     def test_step(self, batch):
         x, y = batch
         logits = self(x)
@@ -77,3 +68,88 @@ class LitClassifierModel(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+    
+### FASTER RCNN ###
+class LitDetectorModel(pl.LightningModule):
+    
+    def __init__(
+        self, 
+        num_classes: int = 1, 
+        learning_rate: float = 2e-4
+    ):
+        """Object Detection model built with PyTorch Lightning using Faster R-CNN.
+
+        Args:
+            num_classes (int, optional): Number of classes. Defaults to 1.
+            learning_rate (float, optional): Rate at which to adjust model weights. Defaults to 2e-4.
+        """
+        super().__init__()
+        
+        # Define properties
+        self.save_hyperparameters()
+        self.hparams.lr = learning_rate
+        self.hparams.num_classes = num_classes
+        
+        # Define the model
+        self.model = fasterrcnn_resnet50_fpn(pretrained=False, num_classes=num_classes)
+        
+        # mAP calculation
+        self.val_map_metric = torchmetrics.detection.MeanAveragePrecision(box_format='xyxy')
+        self.test_map_metric = torchmetrics.detection.MeanAveragePrecision(box_format='xyxy')
+        self.validation_outputs = []
+        self.test_outputs = []
+
+    def forward(self, images, targets=None):
+        return self.model(images, targets)
+        
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        targets = self.format_targets(targets)
+        loss_dict = self.model(images, targets)
+        
+        losses = sum(loss for loss in loss_dict.values())
+        
+        self.log('train_loss', losses, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        return losses
+    
+    def test_step(self, batch, batch_idx):
+        images, targets = batch
+        targets = self.format_targets(targets)
+        outputs = self.model(images)
+        
+        preds = [{k: v.detach() for k, v in t.items()} for t in outputs]
+        
+        # Wrap targets in a list of dictionaries
+        formatted_targets = targets
+        
+        self.test_map_metric.update(preds, formatted_targets)
+        self.test_outputs.append({'preds': preds, 'targets': formatted_targets})
+        
+        return outputs
+    
+    def on_test_epoch_end(self):
+        if not self.test_outputs:
+            mAP_result = {'map': torch.tensor(0.0)}
+        else:
+            mAP_result = self.test_map_metric.compute()
+            self.test_map_metric.reset()
+
+        # Log only the keys that contain "map"
+        map_keys = {key: value for key, value in mAP_result.items() if 'map' in key}
+        for key, value in map_keys.items():
+            self.log(f'test_{key}', value, on_epoch=True, prog_bar=True, logger=True)
+        
+        self.test_outputs.clear()
+    
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+    
+    def format_targets(self, targets):
+        """Convert the targets to the format expected by the model."""
+        formatted_targets = []
+        for boxes, labels in zip(targets['boxes'], targets['labels']):
+            formatted_targets.append({
+                'boxes': boxes,
+                'labels': labels
+            })
+        return formatted_targets

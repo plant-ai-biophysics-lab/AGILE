@@ -38,7 +38,7 @@ def main(
     for i in range(rounds):
         
         # define sampling method and model
-        train_dataset, test_dataset = us.sample(chunk=chunk, method=method, model=model, batch_size=batch_size)
+        train_dataset, test_dataset = us.sample(chunk=chunk, method=method, model=model, dm=PASCALDataModule, batch_size=batch_size)
         if model is None:
             model = LitDetectorModel(num_classes=20, learning_rate=lr)
         

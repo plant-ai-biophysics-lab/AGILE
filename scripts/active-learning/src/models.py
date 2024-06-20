@@ -4,6 +4,8 @@ import lightning as pl
 import torch.nn.functional as F
 
 from torch import nn
+from src.util import CustomFasterRCNN
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 
 ### SIMPLE CLASSIFIER ###
@@ -91,7 +93,9 @@ class LitDetectorModel(pl.LightningModule):
         self.hparams.num_classes = num_classes
         
         # Define the model
-        self.model = fasterrcnn_resnet50_fpn(pretrained=False, num_classes=num_classes)
+        # backbone = resnet_fpn_backbone('resnet50', pretrained=False)
+        backbone = fasterrcnn_resnet50_fpn().backbone
+        self.model = CustomFasterRCNN(backbone, num_classes)
         
         # mAP calculation
         self.val_map_metric = torchmetrics.detection.MeanAveragePrecision(box_format='xyxy')
@@ -102,7 +106,7 @@ class LitDetectorModel(pl.LightningModule):
     def forward(self, images, targets=None):
         return self.model(images, targets)
         
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch):
         images, targets = batch
         targets = self.format_targets(targets)
         loss_dict = self.model(images, targets)
@@ -112,10 +116,10 @@ class LitDetectorModel(pl.LightningModule):
         self.log('train_loss', losses, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return losses
     
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch):
         images, targets = batch
         targets = self.format_targets(targets)
-        outputs = self.model(images)
+        outputs, _ = self.model(images)
         
         preds = [{k: v.detach() for k, v in t.items()} for t in outputs]
         
@@ -140,6 +144,18 @@ class LitDetectorModel(pl.LightningModule):
             self.log(f'test_{key}', value, on_epoch=True, prog_bar=True, logger=True)
         
         self.test_outputs.clear()
+        
+    def predict_step(self, batch):
+        x = batch
+        _, logits = self.model(x)
+        
+        # aggregate probs
+        probs = []
+        for logit in logits:
+            prob = F.softmax(logit, -1)
+            prob = prob.unsqueeze(0)
+            probs.append(prob)
+        return logits, probs
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)

@@ -7,6 +7,7 @@ import lightning as pl
 
 from torch.utils.data import Subset, DataLoader
 from sklearn.cluster import KMeans
+from typing import List
 
 class UncertaintySampling():
     """Active learning class for uncertainty sampling
@@ -19,7 +20,14 @@ class UncertaintySampling():
         self.verbose = verbose
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         
-    def sample(self, chunk: float, method: str, model: pl.LightningModule = None, batch_size: int = 64):
+    def sample(
+        self, 
+        chunk: float, 
+        method: str, 
+        model: pl.LightningModule = None, 
+        dm: pl.LightningDataModule = None, 
+        batch_size: int = 64
+    ):
         """Sample a chunk of the dataset using a specific method
         
         Args:
@@ -34,7 +42,7 @@ class UncertaintySampling():
             if model is None:
                 return self.random_sample(chunk)
             else:
-                return self.entropy_based(chunk, model, batch_size)
+                return self.entropy_based(chunk, model, dm, batch_size)
         elif method == 'entropy_cluster':
             if model is None:
                 return self.random_sample(chunk)
@@ -72,7 +80,12 @@ class UncertaintySampling():
         
             return train_dataset, test_dataset
         
-    def entropy_based(self, chunk: float, model: pl.LightningModule = None, batch_size: int = 64):
+    def entropy_based(
+        self, chunk: float, 
+        model: pl.LightningModule = None, 
+        dm: pl.LightningDataModule = None, 
+        batch_size: int = 64
+    ):
         """ Returns uncertainty score of a probability distribution using entropy 
             
             Assumes probability distribution is a pytorch tensor, like: 
@@ -97,7 +110,10 @@ class UncertaintySampling():
             
         # prepare subset of samples for prediction
         subset = Subset(self.dataset, available_indices)
-        dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        if dm:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
+        else:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
         model.eval()
         
         entropies = []
@@ -111,8 +127,21 @@ class UncertaintySampling():
                 _, probs = model.predict_step(inputs)
                 
                 # calculate entropy
-                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                if isinstance(probs, List):
+                    agg_entropy = []
+                    for prob in probs:
+                        raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1)
+                        prob_size = prob.size(1)
+                        if prob_size <= 0:
+                            continue
+                        sub_normalized_entropy = raw_entropy / math.log2(prob_size)
+                        agg_entropy.append(sub_normalized_entropy)
+                    if len(agg_entropy) == 0:
+                        continue
+                    normalized_entropy = sum(agg_entropy) / len(agg_entropy)
+                else:
+                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
+                    normalized_entropy = raw_entropy / math.log2(probs.size(1))
                 entropies.extend(normalized_entropy.cpu().numpy())
                 indices.extend([available_indices[i] for i in range(len(inputs))])
         
@@ -162,8 +191,16 @@ class UncertaintySampling():
                 logits, probs = model.predict_step(inputs)
                 
                 # calculate entropy
-                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                if isinstance(probs, List):
+                    agg_entropy = []
+                    for prob in probs:
+                        raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1)
+                        sub_normalized_entropy = raw_entropy / math.log2(prob.size(1))
+                        agg_entropy.append(sub_normalized_entropy)
+                    normalized_entropy = sum(agg_entropy) / len(agg_entropy)
+                else:
+                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
+                    normalized_entropy = raw_entropy / math.log2(probs.size(1))
                 features.append(logits.detach())
                 entropies.extend(normalized_entropy.cpu().numpy())
             

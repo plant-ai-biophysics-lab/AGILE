@@ -163,8 +163,15 @@ class UncertaintySampling():
         
         return train_dataset, test_dataset
     
-    def entropy_cluster_based(self, chunk: float, model: pl.LightningModule = None, batch_size: int = 64,
-                              num_clusters: int = 20, max_iter: int = 10):
+    def entropy_cluster_based(
+        self, 
+        chunk: float, 
+        model: pl.LightningModule = None, 
+        dm: pl.LightningDataModule = None, 
+        batch_size: int = 64,
+        num_clusters: int = 20, 
+        max_iter: int = 10
+    ):
         
         # get available samples
         used_samples = self.get_used_samples()
@@ -178,7 +185,10 @@ class UncertaintySampling():
         
         # prepare subset of samples for prediction
         subset = Subset(self.dataset, available_indices)
-        dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        if dm:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
+        else:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
         model.eval()
         
         # extract relevant features
@@ -195,8 +205,13 @@ class UncertaintySampling():
                     agg_entropy = []
                     for prob in probs:
                         raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1)
+                        prob_size = prob.size(1)
+                        if prob_size <= 0:
+                            continue
                         sub_normalized_entropy = raw_entropy / math.log2(prob.size(1))
                         agg_entropy.append(sub_normalized_entropy)
+                    if len(agg_entropy) == 0:
+                        continue
                     normalized_entropy = sum(agg_entropy) / len(agg_entropy)
                 else:
                     raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)

@@ -145,16 +145,17 @@ class LitDetectorModel(pl.LightningModule):
         
         self.test_outputs.clear()
         
-    def predict_step(self, batch):
+    def predict_step(self, batch, dropout: bool = False):
         x = batch
-        _, logits = self.model(x)
         
-        # aggregate probs
-        probs = []
-        for logit in logits:
-            prob = F.softmax(logit, -1)
-            prob = prob.unsqueeze(0)
-            probs.append(prob)
+        # activate dropout if true
+        if dropout:
+            self.model.train()
+        else:
+            self.model.eval()
+            
+        _, logits = self.model(x)
+        probs = F.softmax(logits, dim=-1)
         return logits, probs
     
     def configure_optimizers(self):

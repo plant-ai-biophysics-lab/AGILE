@@ -8,6 +8,8 @@ import lightning as pl
 from torch.utils.data import Subset, DataLoader
 from sklearn.cluster import KMeans
 from typing import List
+from sklearn.impute import SimpleImputer
+from torch.distributions import Categorical
 
 class UncertaintySampling():
     """Active learning class for uncertainty sampling
@@ -19,6 +21,7 @@ class UncertaintySampling():
         self.dataset = dataset
         self.verbose = verbose
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.imputer = SimpleImputer(strategy='mean')
         
     def sample(
         self, 
@@ -47,8 +50,8 @@ class UncertaintySampling():
             if model is None:
                 return self.random_sample(chunk)
             else:
-                return self.entropy_cluster_based(chunk, model, batch_size, 
-                                                  num_clusters=40, max_iter=20)
+                return self.entropy_cluster_based(chunk, model, dm, batch_size, 
+                                                  num_clusters=20, max_iter=20)
         else:
             raise ValueError("Invalid sampling method.")
         
@@ -127,21 +130,8 @@ class UncertaintySampling():
                 _, probs = model.predict_step(inputs)
                 
                 # calculate entropy
-                if isinstance(probs, List):
-                    agg_entropy = []
-                    for prob in probs:
-                        raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1)
-                        prob_size = prob.size(1)
-                        if prob_size <= 0:
-                            continue
-                        sub_normalized_entropy = raw_entropy / math.log2(prob_size)
-                        agg_entropy.append(sub_normalized_entropy)
-                    if len(agg_entropy) == 0:
-                        continue
-                    normalized_entropy = sum(agg_entropy) / len(agg_entropy)
-                else:
-                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                    normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
+                normalized_entropy = raw_entropy / math.log2(probs.size(1))
                 entropies.extend(normalized_entropy.cpu().numpy())
                 indices.extend([available_indices[i] for i in range(len(inputs))])
         
@@ -201,26 +191,14 @@ class UncertaintySampling():
                 logits, probs = model.predict_step(inputs)
                 
                 # calculate entropy
-                if isinstance(probs, List):
-                    agg_entropy = []
-                    for prob in probs:
-                        raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1)
-                        prob_size = prob.size(1)
-                        if prob_size <= 0:
-                            continue
-                        sub_normalized_entropy = raw_entropy / math.log2(prob.size(1))
-                        agg_entropy.append(sub_normalized_entropy)
-                    if len(agg_entropy) == 0:
-                        continue
-                    normalized_entropy = sum(agg_entropy) / len(agg_entropy)
-                else:
-                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                    normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
+                normalized_entropy = raw_entropy / math.log2(probs.size(1))
                 features.append(logits.detach())
                 entropies.extend(normalized_entropy.cpu().numpy())
             
         # flatten the list of features
         features = torch.cat(features).cpu().numpy()
+        features = self.imputer.fit_transform(features)
         
         # perform K-means clustering on the features
         kmeans = KMeans(n_clusters=num_clusters, max_iter=max_iter, random_state=42)
@@ -250,6 +228,103 @@ class UncertaintySampling():
         self.set_used_samples(used_samples + selected_indices)
         train_dataset = Subset(self.dataset, used_samples + selected_indices)
             
+        # create the new dataset with the remaining samples (pool set)
+        unselected_indices = list(all_indices - set(used_samples + selected_indices))
+        test_dataset = Subset(self.dataset, unselected_indices)
+        
+        return train_dataset, test_dataset
+    
+    def BatchBALD(
+        self,
+        chunk: float,
+        model: pl.LightningModule = None,
+        dm: pl.LightningDataModule = None,
+        batch_size: int = 64,
+        num_samples: int = 100  # number of MC samples
+    ):
+        """Bayesian Active Learning by Disagreement (BALD) is a mutual-information-based method for active learning.
+        Selecting the most informative samples from a pool of data.
+
+        Args:
+            chunk (float): _description_
+            model (pl.LightningModule, optional): _description_. Defaults to None.
+            dm (pl.LightningDataModule, optional): _description_. Defaults to None.
+            batch_size (int, optional): _description_. Defaults to 64.
+            num_samples (int, optional): _description_. Defaults to 100#numberofMCsamples.
+
+        Raises:
+            ValueError: _description_
+        """
+        # get available samples
+        used_samples = self.get_used_samples()
+        all_indices = set(range(len(self.dataset)))
+        available_indices = list(all_indices - set(used_samples))
+        
+        if chunk < 1.0:
+            n_train = int(len(self.dataset) * chunk)
+            if len(available_indices) < n_train:
+                raise ValueError("Not enough available indices to sample the required number of examples.")
+        else:
+            n_train = len(available_indices)  # When chunk is 1.0 or higher, use all available samples
+        
+        # get random subset from pool (computational reasons)
+        p_samples = random.sample(available_indices, n_train)
+        
+        # prepare subset of samples for prediction
+        subset = Subset(self.dataset, p_samples)
+        if dm:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
+        else:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        model.eval()
+        
+        all_entropies = []
+        all_log_probs = []
+        
+        # get class probabilities for each sample
+        with torch.no_grad():
+            for batch in dataloader:
+                inputs, _ = batch
+                inputs = inputs.to(self.device)
+                
+                # Multiple forward passes to get MC samples
+                batch_log_probs = []
+                for _ in range(num_samples):
+                    logits, probs = self.predict_step(inputs, dropout=True)  # enable dropout during inference
+                    batch_log_probs.append(probs.log())
+                
+                batch_log_probs = torch.stack(batch_log_probs, dim=1)  # Shape: [batch_size, num_samples, num_classes]
+                all_log_probs.append(batch_log_probs.cpu())
+                
+                # calculate entropy for each detection
+                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
+                normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                all_entropies.append(normalized_entropy.cpu().numpy())
+        
+        all_log_probs = torch.cat(all_log_probs, dim=0)  # shape: [dataset_size, num_samples, num_classes]
+        mean_log_probs = all_log_probs.mean(dim=1)  # shape: [dataset_size, num_classes]
+        
+        # calculate predictive entropy
+        predictive_entropy = Categorical(logits=mean_log_probs).entropy()
+        
+        # calculate expected entropy
+        expected_entropy = Categorical(logits=all_log_probs).entropy().mean(dim=1)
+        
+        # calculate mutual information
+        mutual_information = predictive_entropy - expected_entropy
+        
+        # select top samples based on mutual information
+        n_train = min(n_train, len(mutual_information))  # ensure n_train does not exceed the number of available samples
+        _, top_indices = torch.topk(mutual_information, n_train)
+        
+        selected_indices = [p_samples[i] for i in top_indices]
+        
+        # update used samples
+        self.set_used_samples(used_samples + selected_indices)
+        
+        # create the new dataset with the selected samples (train set)
+        train_dataset = Subset(self.dataset, used_samples + selected_indices)
+        
         # create the new dataset with the remaining samples (pool set)
         unselected_indices = list(all_indices - set(used_samples + selected_indices))
         test_dataset = Subset(self.dataset, unselected_indices)

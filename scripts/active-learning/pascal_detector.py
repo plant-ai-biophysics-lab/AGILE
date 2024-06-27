@@ -8,6 +8,7 @@ from albumentations.pytorch import ToTensorV2
 from src.data import PASCALDataModule, PASCALDataset
 from src.models import LitDetectorModel
 from src.sampling import UncertaintySampling
+from src.util import update_model
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
@@ -74,6 +75,7 @@ def main(
         ckpt_path = glob.glob(ckpts)[0]
         trainer.test(ckpt_path=ckpt_path, datamodule=dm)
         model = LitDetectorModel.load_from_checkpoint(checkpoint_path=ckpt_path)
+        model = update_model(model, method, type='fasterrcnn')
         
         wandb.finish() # finish wandb run
         i += 1 # update index

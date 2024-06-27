@@ -1,12 +1,15 @@
 import torch
+import lightning as pl
 import torch.nn.functional as F
 from torchvision.ops import boxes as box_ops
 
+from torch import nn
 from collections import OrderedDict
 from typing import List, Tuple
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.image_list import ImageList
 
+### CUSTOM FASTERRCNN CLASS ###
 class CustomFasterRCNN(FasterRCNN):
     
     def __init__(self, backbone, num_classes):
@@ -61,37 +64,67 @@ class CustomFasterRCNN(FasterRCNN):
         class_logits_list = class_logits.split(boxes_per_image, 0)
         
         all_logits = []
-        for boxes, scores, logits, image_shape in zip(pred_boxes_list, pred_scores_list, class_logits_list, original_image_sizes):
+        for i, (boxes, scores, logits, image_shape) in enumerate(zip(pred_boxes_list, pred_scores_list, class_logits_list, original_image_sizes)):
             boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
 
             # create labels for each prediction
-            labels = torch.arange(20, device=device)
+            labels = torch.arange(20, device=device)  # Assuming 19 classes + 1 background class
             labels = labels.view(1, -1).expand_as(scores)
 
             # remove predictions with the background label
-            boxes = boxes[:, 1:]
-            scores = scores[:, 1:]
-            logits = logits[:, 1:]
-            labels = labels[:, 1:]
+            if boxes.size(1) > 1:
+                boxes = boxes[:, 1:]
+                scores = scores[:, 1:]
+                labels = labels[:, 1:]
+                logits = logits[:, 1:]
 
             # batch everything, by making every class prediction be a separate instance
             boxes = boxes.reshape(-1, 4)
             scores = scores.reshape(-1)
-            logits = logits.reshape(-1)
             labels = labels.reshape(-1)
+            logits = logits.repeat_interleave(19, dim=0)
 
             # remove low scoring boxes
-            inds = torch.where(scores > self.roi_heads.score_thresh)[0]
-            boxes, scores, logits, labels = boxes[inds], scores[inds], logits[inds], labels[inds]
+            score_inds = torch.where(scores > self.roi_heads.score_thresh)[0]
+            boxes, scores, labels, logits = boxes[score_inds], scores[score_inds], labels[score_inds], logits[score_inds]
 
             # remove empty boxes
             keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
-            boxes, scores, logits, labels = boxes[keep], scores[keep], logits[keep], labels[keep]
+            boxes, scores, labels, logits = boxes[keep], scores[keep], labels[keep], logits[keep]
 
             # non-maximum suppression, independently done per class
             keep = box_ops.batched_nms(boxes, scores, labels, self.roi_heads.nms_thresh)
-            boxes, scores, logits, labels = boxes[keep], scores[keep], logits[keep], labels[keep]
+            boxes, scores, labels, logits = boxes[keep], scores[keep], labels[keep], logits[keep]
 
-            all_logits.append(scores)
+            # append filtered logits to all_logits
+            all_logits.append(logits.mean(dim=0))
 
+        all_logits = torch.stack(all_logits)
         return outputs, all_logits
+    
+### MCDROPOUT MODULE ###
+class MCDropout(nn.Module):
+    def __init__(self, p=0.5):
+        super(MCDropout, self).__init__()
+        self.dropout = nn.Dropout(p)
+
+    def forward(self, x):
+        return self.dropout(x)
+    
+### MODEL UPDATE FUNCTIONS ###
+def update_model(
+    model: pl.LightningModule,
+    method: str,
+    type: str = 'fasterrcnn'
+):
+    if method == 'BatchBALD' and type == 'fasterrcnn':
+        model.roi_heads.box_head.fc6 = nn.Sequential(
+            model.roi_heads.box_head.fc6,
+            MCDropout(p=0.5)
+        )
+        model.roi_heads.box_head.fc7 = nn.Sequential(
+            model.roi_heads.box_head.fc7,
+            MCDropout(p=0.5)
+        )
+    
+    return model

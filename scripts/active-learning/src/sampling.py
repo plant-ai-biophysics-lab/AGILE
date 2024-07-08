@@ -1,3 +1,6 @@
+import sys
+sys.setrecursionlimit(1000000)  # Set this to a higher value
+
 import random
 import torch
 import math
@@ -251,7 +254,7 @@ class UncertaintySampling():
         model: pl.LightningModule = None,
         dm: pl.LightningDataModule = None,
         batch_size: int = 64,
-        num_samples: int = 2  # number of MC samples
+        num_samples: int = 100  # number of MC samples
     ):
         """Batch Bayesian Active Learning by Disagreement (BatchBALD) method for active learning.
         Selecting the most informative samples from a pool of data.

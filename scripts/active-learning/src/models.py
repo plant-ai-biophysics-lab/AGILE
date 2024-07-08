@@ -166,6 +166,12 @@ class LitDetectorModel(pl.LightningModule):
         x = batch
         _, logits = self.model(x, dropout=self.hparams.dropout)
         probs = F.softmax(logits, dim=-1)
+        
+        # check for NaNs in probs and replace them with random probabilities
+        if torch.isnan(probs).any():
+            nan_mask = torch.isnan(probs)
+            probs[nan_mask] = torch.rand(nan_mask.sum(), device=probs.device)
+            
         return logits, probs
     
     def configure_optimizers(self):

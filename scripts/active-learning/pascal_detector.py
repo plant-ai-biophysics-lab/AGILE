@@ -8,7 +8,6 @@ from albumentations.pytorch import ToTensorV2
 from src.data import PASCALDataModule, PASCALDataset
 from src.models import LitDetectorModel
 from src.sampling import UncertaintySampling
-from src.util import update_model
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
@@ -26,6 +25,11 @@ def main(
     # set seed
     pl.seed_everything(42)
     
+    if method == 'BatchBALD':
+        dropout = True
+    else:
+        dropout = False
+    
     # create sampling class
     transform = A.Compose([
         A.Resize(image_size, image_size),
@@ -41,14 +45,15 @@ def main(
         # define sampling method and model
         train_dataset, test_dataset = us.sample(chunk=chunk, method=method, model=model, dm=PASCALDataModule, batch_size=batch_size)
         if model is None:
-            model = LitDetectorModel(num_classes=20, learning_rate=lr)
+            model = LitDetectorModel(num_classes=20, learning_rate=lr, dropout=dropout)
         
         # create data module
         dm = PASCALDataModule(
             root_dir=root_dir, 
             batch_size=batch_size, 
             train_dataset=train_dataset,
-            test_dataset=test_dataset,
+            # test_dataset=test_dataset,
+            test_dataset=None,
             image_size=image_size
         )
         
@@ -73,9 +78,8 @@ def main(
         prj_name = wandb_logger.name
         ckpts = f'{logs_dir}/{prj_name}/{run_id}/checkpoints/*.ckpt'
         ckpt_path = glob.glob(ckpts)[0]
-        trainer.test(ckpt_path=ckpt_path, datamodule=dm)
-        model = LitDetectorModel.load_from_checkpoint(checkpoint_path=ckpt_path)
-        model = update_model(model, method, type='fasterrcnn')
+        # trainer.test(ckpt_path=ckpt_path, datamodule=dm)
+        model = LitDetectorModel.load_from_checkpoint(checkpoint_path=ckpt_path, dropout=dropout, strict=False)
         
         wandb.finish() # finish wandb run
         i += 1 # update index

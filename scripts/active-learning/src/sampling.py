@@ -2,14 +2,14 @@ import random
 import torch
 import math
 import torchvision.datasets
-
 import lightning as pl
 
 from torch.utils.data import Subset, DataLoader
 from sklearn.cluster import KMeans
 from typing import List
 from sklearn.impute import SimpleImputer
-from torch.distributions import Categorical
+from src.util import get_batchbald_batch
+from tqdm import tqdm
 
 class UncertaintySampling():
     """Active learning class for uncertainty sampling
@@ -52,6 +52,11 @@ class UncertaintySampling():
             else:
                 return self.entropy_cluster_based(chunk, model, dm, batch_size, 
                                                   num_clusters=20, max_iter=20)
+        elif method == 'BatchBALD':
+            if model is None:
+                return self.random_sample(chunk)
+            else:
+                return self.BatchBALD(chunk, model, dm, batch_size)
         else:
             raise ValueError("Invalid sampling method.")
         
@@ -200,37 +205,43 @@ class UncertaintySampling():
         features = torch.cat(features).cpu().numpy()
         features = self.imputer.fit_transform(features)
         
-        # perform K-means clustering on the features
-        kmeans = KMeans(n_clusters=num_clusters, max_iter=max_iter, random_state=42)
-        kmeans.fit(features)
-        cluster_labels = kmeans.labels_
-        
-        # calculate average uncertainty for each cluster
-        clusters = {i: [] for i in range(num_clusters)}
-        for idx, label in enumerate(cluster_labels):
-            clusters[label].append(entropies[idx])
+        if features is not None and features.shape[1] > 0:
+            # perform K-means clustering on the features
+            kmeans = KMeans(n_clusters=num_clusters, max_iter=max_iter, random_state=42)
+            kmeans.fit(features)
+            cluster_labels = kmeans.labels_
             
-        # identify the cluster with the highest average normalized uncertainty
-        highest_avg_uncertainty = -1
-        most_uncertain_cluster = None
-        for cluster, scores in clusters.items():
-            if scores:
-                avg_uncertainty = sum(scores) / len(scores)
-                if avg_uncertainty > highest_avg_uncertainty:
-                    highest_avg_uncertainty = avg_uncertainty
-                    most_uncertain_cluster = cluster
-                    
-        # sample items from the most uncertain cluster
-        indices = [i for i, label in enumerate(cluster_labels) if label == most_uncertain_cluster]
-        selected_indices = random.sample(indices, min(len(indices), n_train))
-        
-        # create the new dataset with the selected samples (train set)
-        self.set_used_samples(used_samples + selected_indices)
-        train_dataset = Subset(self.dataset, used_samples + selected_indices)
+            # calculate average uncertainty for each cluster
+            clusters = {i: [] for i in range(num_clusters)}
+            for idx, label in enumerate(cluster_labels):
+                clusters[label].append(entropies[idx])
+                
+            # identify the cluster with the highest average normalized uncertainty
+            highest_avg_uncertainty = -1
+            most_uncertain_cluster = None
+            for cluster, scores in clusters.items():
+                if scores:
+                    avg_uncertainty = sum(scores) / len(scores)
+                    if avg_uncertainty > highest_avg_uncertainty:
+                        highest_avg_uncertainty = avg_uncertainty
+                        most_uncertain_cluster = cluster
+                        
+            # sample items from the most uncertain cluster
+            indices = [i for i, label in enumerate(cluster_labels) if label == most_uncertain_cluster]
+            selected_indices = random.sample(indices, min(len(indices), n_train))
             
-        # create the new dataset with the remaining samples (pool set)
-        unselected_indices = list(all_indices - set(used_samples + selected_indices))
-        test_dataset = Subset(self.dataset, unselected_indices)
+            # create the new dataset with the selected samples (train set)
+            self.set_used_samples(used_samples + selected_indices)
+            train_dataset = Subset(self.dataset, used_samples + selected_indices)
+                
+            # create the new dataset with the remaining samples (pool set)
+            unselected_indices = list(all_indices - set(used_samples + selected_indices))
+            test_dataset = Subset(self.dataset, unselected_indices)
+            
+        else:
+            # random sample
+            print("NO FEATURES - RANDOM SAMPLING INSTEAD")
+            train_dataset, test_dataset = self.random_sample(chunk)
         
         return train_dataset, test_dataset
     
@@ -240,21 +251,25 @@ class UncertaintySampling():
         model: pl.LightningModule = None,
         dm: pl.LightningDataModule = None,
         batch_size: int = 64,
-        num_samples: int = 100  # number of MC samples
+        num_samples: int = 2  # number of MC samples
     ):
-        """Bayesian Active Learning by Disagreement (BALD) is a mutual-information-based method for active learning.
+        """Batch Bayesian Active Learning by Disagreement (BatchBALD) method for active learning.
         Selecting the most informative samples from a pool of data.
+        
+        Paper: https://arxiv.org/abs/1906.08158
 
         Args:
-            chunk (float): _description_
-            model (pl.LightningModule, optional): _description_. Defaults to None.
-            dm (pl.LightningDataModule, optional): _description_. Defaults to None.
-            batch_size (int, optional): _description_. Defaults to 64.
-            num_samples (int, optional): _description_. Defaults to 100#numberofMCsamples.
+            chunk (float): Fraction of the dataset to use.
+            model (pl.LightningModule, optional): Model to use for predictions. Defaults to None.
+            dm (pl.LightningDataModule, optional): Data module. Defaults to None.
+            batch_size (int, optional): Batch size for data loader. Defaults to 64.
+            num_samples (int, optional): Number of Monte Carlo samples. Defaults to 10.
+            acquisition_size (int, optional): Number of points to acquire in each batch. Defaults to 10.
 
         Raises:
-            ValueError: _description_
+            ValueError: If there are not enough available indices to sample the required number of examples.
         """
+        
         # get available samples
         used_samples = self.get_used_samples()
         all_indices = set(range(len(self.dataset)))
@@ -268,7 +283,7 @@ class UncertaintySampling():
             n_train = len(available_indices)  # When chunk is 1.0 or higher, use all available samples
         
         # get random subset from pool (computational reasons)
-        p_samples = random.sample(available_indices, n_train)
+        p_samples = random.sample(available_indices, n_train*2)
         
         # prepare subset of samples for prediction
         subset = Subset(self.dataset, p_samples)
@@ -278,53 +293,53 @@ class UncertaintySampling():
             dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
         model.eval()
         
-        all_entropies = []
-        all_log_probs = []
+        all_probs = []
         
         # get class probabilities for each sample
+        torch.cuda.empty_cache()
         with torch.no_grad():
-            for batch in dataloader:
+            for batch in tqdm(dataloader, desc="Predicting"):
                 inputs, _ = batch
                 inputs = inputs.to(self.device)
                 
-                # Multiple forward passes to get MC samples
-                batch_log_probs = []
-                for _ in range(num_samples):
-                    logits, probs = self.predict_step(inputs, dropout=True)  # enable dropout during inference
-                    batch_log_probs.append(probs.log())
-                
-                batch_log_probs = torch.stack(batch_log_probs, dim=1)  # Shape: [batch_size, num_samples, num_classes]
-                all_log_probs.append(batch_log_probs.cpu())
-                
-                # calculate entropy for each detection
-                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                normalized_entropy = raw_entropy / math.log2(probs.size(1))
-                all_entropies.append(normalized_entropy.cpu().numpy())
-        
-        all_log_probs = torch.cat(all_log_probs, dim=0)  # shape: [dataset_size, num_samples, num_classes]
-        mean_log_probs = all_log_probs.mean(dim=1)  # shape: [dataset_size, num_classes]
-        
-        # calculate predictive entropy
-        predictive_entropy = Categorical(logits=mean_log_probs).entropy()
-        
-        # calculate expected entropy
-        expected_entropy = Categorical(logits=all_log_probs).entropy().mean(dim=1)
-        
-        # calculate mutual information
-        mutual_information = predictive_entropy - expected_entropy
-        
-        # select top samples based on mutual information
-        n_train = min(n_train, len(mutual_information))  # ensure n_train does not exceed the number of available samples
-        _, top_indices = torch.topk(mutual_information, n_train)
-        
-        selected_indices = [p_samples[i] for i in top_indices]
-        
+                try:
+                    # multiple forward passes to get MC samples
+                    batch_probs = []
+                    for _ in range(num_samples):
+                        _, probs = model.predict_step(inputs.clone())  # clone inputs for each forward pass
+                        
+                        # Check for NaNs or Infs in probs
+                        if torch.isnan(probs).any() or torch.isinf(probs).any():
+                            raise ValueError("NaNs or Infs detected in the probability tensor.")
+                        probs = torch.clamp(probs, min=1e-6)
+                        log_probs = torch.log(probs)
+                        batch_probs.append(log_probs.cpu())
+
+                    batch_probs = torch.stack(batch_probs, dim=1)  # shape: [batch_size, num_samples, num_classes]
+                    all_probs.append(batch_probs.cpu())
+                    torch.cuda.empty_cache()
+                    
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        print('CUDA out of memory. Attempting to free memory and continue.')
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
+
+        all_probs = torch.cat(all_probs, dim=0)  # shape: [dataset_size, num_samples, num_classes]
+
+        # Compute BatchBALD batch
+        candidate_batch = get_batchbald_batch(all_probs, n_train, num_samples)
+
+        selected_indices = [p_samples[i] for i in candidate_batch.indices]
+
         # update used samples
         self.set_used_samples(used_samples + selected_indices)
-        
+
         # create the new dataset with the selected samples (train set)
         train_dataset = Subset(self.dataset, used_samples + selected_indices)
-        
+
         # create the new dataset with the remaining samples (pool set)
         unselected_indices = list(all_indices - set(used_samples + selected_indices))
         test_dataset = Subset(self.dataset, unselected_indices)

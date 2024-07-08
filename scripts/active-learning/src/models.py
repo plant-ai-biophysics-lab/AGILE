@@ -11,7 +11,12 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 ### SIMPLE CLASSIFIER ###
 class LitClassifierModel(pl.LightningModule):
     
-    def __init__(self, num_classes: int = 1, hidden_dim: int = 64, learning_rate: float = 2e-4):
+    def __init__(
+        self, 
+        num_classes: int = 1, 
+        hidden_dim: int = 64, 
+        learning_rate: float = 2e-4
+    ):
         """Simple Classification model built with PyTorch Lightning.
 
         Args:
@@ -52,6 +57,16 @@ class LitClassifierModel(pl.LightningModule):
         self.log('train_acc', acc, on_step=True, on_epoch=True, logger=True)
         return {'loss': loss, 'acc': acc}
     
+    def validation_step(self, batch):
+        x, y = batch
+        logits = self(x)
+        loss = F.cross_entropy(logits, y)
+        acc = self.accuracy(logits, y)
+        
+        self.log('val_loss', loss, on_step=True, on_epoch=True, logger=True)
+        self.log('val_acc', acc, on_step=True, on_epoch=True, logger=True)
+        return {'val_loss': loss, 'val_acc': acc}
+    
     def test_step(self, batch):
         x, y = batch
         logits = self(x)
@@ -77,7 +92,8 @@ class LitDetectorModel(pl.LightningModule):
     def __init__(
         self, 
         num_classes: int = 1, 
-        learning_rate: float = 2e-4
+        learning_rate: float = 2e-4,
+        dropout: bool = False
     ):
         """Object Detection model built with PyTorch Lightning using Faster R-CNN.
 
@@ -88,20 +104,21 @@ class LitDetectorModel(pl.LightningModule):
         super().__init__()
         
         # Define properties
-        self.save_hyperparameters()
         self.hparams.lr = learning_rate
         self.hparams.num_classes = num_classes
+        self.hparams.dropout = dropout
         
         # Define the model
         # backbone = resnet_fpn_backbone('resnet50', pretrained=False)
         backbone = fasterrcnn_resnet50_fpn().backbone
-        self.model = CustomFasterRCNN(backbone, num_classes)
+        self.model = CustomFasterRCNN(backbone, num_classes, self.hparams.dropout)
         
         # mAP calculation
         self.val_map_metric = torchmetrics.detection.MeanAveragePrecision(box_format='xyxy')
         self.test_map_metric = torchmetrics.detection.MeanAveragePrecision(box_format='xyxy')
         self.validation_outputs = []
         self.test_outputs = []
+        self.save_hyperparameters()
 
     def forward(self, images, targets=None):
         return self.model(images, targets)
@@ -109,7 +126,7 @@ class LitDetectorModel(pl.LightningModule):
     def training_step(self, batch):
         images, targets = batch
         targets = self.format_targets(targets)
-        loss_dict = self.model(images, targets)
+        loss_dict = self.model(images, targets, dropout=self.hparams.dropout)
         
         losses = sum(loss for loss in loss_dict.values())
         
@@ -145,16 +162,9 @@ class LitDetectorModel(pl.LightningModule):
         
         self.test_outputs.clear()
         
-    def predict_step(self, batch, dropout: bool = False):
+    def predict_step(self, batch):
         x = batch
-        
-        # activate dropout if true
-        if dropout:
-            self.model.train()
-        else:
-            self.model.eval()
-            
-        _, logits = self.model(x)
+        _, logits = self.model(x, dropout=self.hparams.dropout)
         probs = F.softmax(logits, dim=-1)
         return logits, probs
     

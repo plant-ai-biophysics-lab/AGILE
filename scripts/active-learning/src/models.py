@@ -92,8 +92,7 @@ class LitDetectorModel(pl.LightningModule):
     def __init__(
         self, 
         num_classes: int = 1, 
-        learning_rate: float = 2e-4,
-        dropout: bool = False
+        learning_rate: float = 2e-4
     ):
         """Object Detection model built with PyTorch Lightning using Faster R-CNN.
 
@@ -103,15 +102,17 @@ class LitDetectorModel(pl.LightningModule):
         """
         super().__init__()
         
-        # Define properties
+        # define properties
         self.hparams.lr = learning_rate
         self.hparams.num_classes = num_classes
-        self.hparams.dropout = dropout
         
-        # Define the model
-        # backbone = resnet_fpn_backbone('resnet50', pretrained=False)
+        # define the model
         backbone = fasterrcnn_resnet50_fpn().backbone
-        self.model = CustomFasterRCNN(backbone, num_classes, self.hparams.dropout)
+        self.model = CustomFasterRCNN(backbone, num_classes)
+        
+        # define layers
+        self.fc6_dropout = nn.Dropout(p=0.5)
+        self.fc7_dropout = nn.Dropout(p=0.5)
         
         # mAP calculation
         self.val_map_metric = torchmetrics.detection.MeanAveragePrecision(box_format='xyxy')
@@ -126,7 +127,7 @@ class LitDetectorModel(pl.LightningModule):
     def training_step(self, batch):
         images, targets = batch
         targets = self.format_targets(targets)
-        loss_dict = self.model(images, targets, dropout=self.hparams.dropout)
+        loss_dict = self.model(images, targets)
         
         losses = sum(loss for loss in loss_dict.values())
         
@@ -162,9 +163,23 @@ class LitDetectorModel(pl.LightningModule):
         
         self.test_outputs.clear()
         
-    def predict_step(self, batch):
+    def predict_step(self, batch, dropout):
+        
+        # define dropout layers
+        if dropout:
+            if not self.has_dropout(self.model.roi_heads.box_head.fc6, self.fc6_dropout):
+                self.model.roi_heads.box_head.fc6 = nn.Sequential(
+                    self.model.roi_heads.box_head.fc6,
+                    self.fc6_dropout
+                )
+            if not self.has_dropout(self.model.roi_heads.box_head.fc7, self.fc7_dropout):
+                self.model.roi_heads.box_head.fc7 = nn.Sequential(
+                    self.model.roi_heads.box_head.fc7,
+                    self.fc7_dropout
+                )
+        
         x = batch
-        _, logits = self.model(x, dropout=self.hparams.dropout)
+        _, logits = self.model(x)
         probs = F.softmax(logits, dim=-1)
         
         # check for NaNs in probs and replace them with random probabilities
@@ -186,3 +201,11 @@ class LitDetectorModel(pl.LightningModule):
                 'labels': labels
             })
         return formatted_targets
+    
+    @staticmethod
+    def has_dropout(layer, dropout_layer):
+        return isinstance(layer, nn.Sequential) and dropout_layer in layer.children()
+    
+    def _return_model(self):
+        self.model.roi_heads.box_head.fc6 = self.model.roi_heads.box_head.fc6[0]
+        self.model.roi_heads.box_head.fc7 = self.model.roi_heads.box_head.fc7[0]

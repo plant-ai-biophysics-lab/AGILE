@@ -16,21 +16,8 @@ from tqdm.auto import tqdm
 ### CUSTOM FASTERRCNN CLASS ###
 class CustomFasterRCNN(FasterRCNN):
     
-    def __init__(self, backbone, num_classes, dropout):
+    def __init__(self, backbone, num_classes):
         super(CustomFasterRCNN, self).__init__(backbone, num_classes)
-        
-        # define dropout layers
-        self.fc6_dropout = nn.Dropout(p=0.5)
-        self.fc7_dropout = nn.Dropout(p=0.5)
-        if dropout:
-            self.roi_heads.box_head.fc6 = nn.Sequential(
-                self.roi_heads.box_head.fc6,
-                self.fc6_dropout
-            )
-            self.roi_heads.box_head.fc7 = nn.Sequential(
-                self.roi_heads.box_head.fc7,
-                self.fc7_dropout
-            )
         
     def forward(self, images, targets=None, dropout=False):
         if self.training:

@@ -309,7 +309,7 @@ class UncertaintySampling():
                     # multiple forward passes to get MC samples
                     batch_probs = []
                     for _ in range(num_samples):
-                        _, probs = model.predict_step(inputs.clone())  # clone inputs for each forward pass
+                        _, probs = model.predict_step(inputs.clone(), dropout=True)  # clone inputs for each forward pass
                         
                         # Check for NaNs or Infs in probs
                         if torch.isnan(probs).any() or torch.isinf(probs).any():
@@ -346,6 +346,9 @@ class UncertaintySampling():
         # create the new dataset with the remaining samples (pool set)
         unselected_indices = list(all_indices - set(used_samples + selected_indices))
         test_dataset = Subset(self.dataset, unselected_indices)
+        
+        # return model to original state
+        model._return_model()
         
         return train_dataset, test_dataset
         

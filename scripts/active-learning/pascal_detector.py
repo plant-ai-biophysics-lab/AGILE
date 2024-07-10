@@ -73,7 +73,7 @@ def main(
         prj_name = wandb_logger.name
         ckpts = f'{logs_dir}/{prj_name}/{run_id}/checkpoints/*.ckpt'
         ckpt_path = glob.glob(ckpts)[0]
-        # trainer.test(ckpt_path=ckpt_path, datamodule=dm)
+        trainer.test(ckpt_path=ckpt_path, datamodule=dm)
         model = LitDetectorModel.load_from_checkpoint(checkpoint_path=ckpt_path)
         
         wandb.finish() # finish wandb run

@@ -43,21 +43,24 @@ class UncertaintySampling():
             batch_size (int): batch size for prediction
         """
         if method == 'random':
-            return self.random_sample(chunk)
+            if model is None:
+                return self.random_sample(chunk = 0.5) # seed model
+            else:
+                return self.random_sample(chunk)
         elif method == 'entropy':
             if model is None:
-                return self.random_sample(chunk)
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.entropy_based(chunk, model, dm, batch_size)
         elif method == 'entropy_cluster':
             if model is None:
-                return self.random_sample(chunk)
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.entropy_cluster_based(chunk, model, dm, batch_size, 
                                                   num_clusters=20, max_iter=20)
         elif method == 'BatchBALD':
             if model is None:
-                return self.random_sample(chunk)
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.BatchBALD(chunk, model, dm, batch_size)
         else:
@@ -137,9 +140,9 @@ class UncertaintySampling():
                 inputs = inputs.to(self.device)
                 _, probs = model.predict_step(inputs)
                 
-                # calculate entropy
-                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                # calculate entropy 
+                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) # TODO: Calculate the entropy per box of each image.
+                normalized_entropy = raw_entropy / math.log2(probs.size(1))       # TODO: Average the entropy of all the boxes in each image.
                 entropies.extend(normalized_entropy.cpu().numpy())
                 indices.extend([available_indices[i] for i in range(len(inputs))])
         
@@ -290,10 +293,10 @@ class UncertaintySampling():
         
         # prepare subset of samples for prediction
         subset = Subset(self.dataset, p_samples)
-        if dm:
+        if dm is not None:
             dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
         else:
-            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+            raise ValueError("Data module is required for BatchBALD.")
         model.eval()
         
         all_probs = []

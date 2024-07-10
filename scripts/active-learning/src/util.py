@@ -112,7 +112,8 @@ class CustomFasterRCNN(FasterRCNN):
             boxes, scores, labels, logits = boxes[keep], scores[keep], labels[keep], logits[keep]
 
             # append filtered logits to all_logits
-            all_logits.append(logits.mean(dim=0))
+            all_logits.append(logits.mean(dim=0)) # TODO: Instead of averaging the logits, average the entropy values.
+                                                  # TODO: Aggregate all the logits different (per image)
 
         all_logits = torch.stack(all_logits)
         return outputs, all_logits

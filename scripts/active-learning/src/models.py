@@ -180,7 +180,7 @@ class LitDetectorModel(pl.LightningModule):
         
         x = batch
         _, logits = self.model(x)
-        probs = F.softmax(logits, dim=-1)
+        probs = F.softmax(logits, dim=-1) # TODO: Since there will be mutiple boxes per image, this might change.
         
         # check for NaNs in probs and replace them with random probabilities
         if torch.isnan(probs).any():

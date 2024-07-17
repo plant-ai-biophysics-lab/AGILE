@@ -6,6 +6,7 @@ import torch
 import math
 import torchvision.datasets
 import lightning as pl
+import numpy as np
 
 from torch.utils.data import Subset, DataLoader
 from sklearn.cluster import KMeans
@@ -44,23 +45,23 @@ class UncertaintySampling():
         """
         if method == 'random':
             if model is None:
-                return self.random_sample(chunk = 0.5) # seed model
+                return self.random_sample(chunk = 0.2) # seed model
             else:
                 return self.random_sample(chunk)
         elif method == 'entropy':
             if model is None:
-                return self.random_sample(chunk = 0.5) # seed model
+                return self.random_sample(chunk = 0.01) # seed model
             else:
                 return self.entropy_based(chunk, model, dm, batch_size)
         elif method == 'entropy_cluster':
             if model is None:
-                return self.random_sample(chunk = 0.5) # seed model
+                return self.random_sample(chunk = 0.2) # seed model
             else:
                 return self.entropy_cluster_based(chunk, model, dm, batch_size, 
                                                   num_clusters=20, max_iter=20)
         elif method == 'BatchBALD':
             if model is None:
-                return self.random_sample(chunk = 0.5) # seed model
+                return self.random_sample(chunk = 0.2) # seed model
             else:
                 return self.BatchBALD(chunk, model, dm, batch_size)
         else:
@@ -138,12 +139,20 @@ class UncertaintySampling():
             for batch in dataloader:
                 inputs, _ = batch
                 inputs = inputs.to(self.device)
-                _, probs = model.predict_step(inputs)
+                _, probs = model.predict_step(inputs, dropout=False)
                 
-                # calculate entropy 
-                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) # TODO: Calculate the entropy per box of each image.
-                normalized_entropy = raw_entropy / math.log2(probs.size(1))       # TODO: Average the entropy of all the boxes in each image.
-                entropies.extend(normalized_entropy.cpu().numpy())
+                # calculate entropy
+                if isinstance(probs, list): # check if probs is a list (e.g. for object detection)
+                    for prob in probs:
+                        raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1) # calcualte the entropy of each detection of each image
+                        normalized_entropy = raw_entropy / math.log2(prob.size(1)) # shape: (num detections in image)
+                        normalized_entropy = torch.mean(normalized_entropy, dim=0) # average the entropy of all the detections in each image [1 number]
+                        normalized_entropy = np.array([normalized_entropy.cpu()])
+                else:
+                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) # TODO: Calculate the entropy per box of each image.
+                    normalized_entropy = raw_entropy / math.log2(probs.size(1))       # TODO: Average the entropy of all the boxes in each image.
+                    normalized_entropy = np.array([normalized_entropy.cpu()])
+                entropies.extend(normalized_entropy)
                 indices.extend([available_indices[i] for i in range(len(inputs))])
         
         # sort indices by highest entropy
@@ -199,13 +208,30 @@ class UncertaintySampling():
             for batch in dataloader:
                 inputs, _ = batch
                 inputs = inputs.to(self.device)
-                logits, probs = model.predict_step(inputs)
+                logits, probs = model.predict_step(inputs, dropout=False)
                 
                 # calculate entropy
-                raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
-                normalized_entropy = raw_entropy / math.log2(probs.size(1))
+                if isinstance(probs, list): # check if probs is a list (e.g. for object detection)
+                    for prob in probs:
+                        raw_entropy = -torch.sum(prob * torch.log2(prob + 1e-5), dim=1) # calcualte the entropy of each detection of each image
+                        normalized_entropy = raw_entropy / math.log2(prob.size(1)) # shape: (num detections in image)
+                        normalized_entropy = torch.mean(normalized_entropy, dim=0) # average the entropy of all the detections in each image [1 number]
+                        normalized_entropy = np.array([normalized_entropy.cpu()])
+                else:
+                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) # TODO: Calculate the entropy per box of each image.
+                    normalized_entropy = raw_entropy / math.log2(probs.size(1))       # TODO: Average the entropy of all the boxes in each image.
+                    normalized_entropy = np.array([normalized_entropy.cpu()])
+                    
+                # format logits if it is a list (e.g. for object detection)
+                if isinstance(logits, list):
+                    # average logits in each image
+                    for i in range(len(logits)):
+                        logits[i] = torch.mean(logits[i], dim=0)
+                    # convert list to tensor
+                    logits = torch.stack(logits)
+                    
                 features.append(logits.detach())
-                entropies.extend(normalized_entropy.cpu().numpy())
+                entropies.extend(normalized_entropy)
             
         # flatten the list of features
         features = torch.cat(features).cpu().numpy()
@@ -257,7 +283,7 @@ class UncertaintySampling():
         model: pl.LightningModule = None,
         dm: pl.LightningDataModule = None,
         batch_size: int = 64,
-        num_samples: int = 100  # number of MC samples
+        num_samples: int = 2  # number of MC samples
     ):
         """Batch Bayesian Active Learning by Disagreement (BatchBALD) method for active learning.
         Selecting the most informative samples from a pool of data.
@@ -312,17 +338,18 @@ class UncertaintySampling():
                     # multiple forward passes to get MC samples
                     batch_probs = []
                     for _ in range(num_samples):
-                        _, probs = model.predict_step(inputs.clone(), dropout=True)  # clone inputs for each forward pass
-                        
-                        # Check for NaNs or Infs in probs
-                        if torch.isnan(probs).any() or torch.isinf(probs).any():
-                            raise ValueError("NaNs or Infs detected in the probability tensor.")
-                        probs = torch.clamp(probs, min=1e-6)
-                        log_probs = torch.log(probs)
-                        batch_probs.append(log_probs.cpu())
+                        _, probs = model.predict_step(inputs.clone(), dropout=True)  # length: batch_size / shape for each index: (num_detections, num_classes)
+                        # log_probs = torch.log(probs) # TODO: dimensions of probs could be different
+                        # replace probs with random probs if empty
+                        for prob in probs:
+                            if prob.nelement() == 0:
+                                prob = torch.rand(1, model.hparams.num_classes - 1)
+                        log_probs = [torch.log(prob).cpu() for prob in probs]
+                        # batch_probs.append(log_probs.cpu())
+                        batch_probs.append(log_probs) # batch_probs length: num_samples
 
-                    batch_probs = torch.stack(batch_probs, dim=1)  # shape: [batch_size, num_samples, num_classes]
-                    all_probs.append(batch_probs.cpu())
+                    # batch_probs = torch.stack(batch_probs, dim=1)  # shape: [batch_size, num_samples, num_classes]
+                    all_probs.append(batch_probs) # all_probs length: len(dataloader) / length for each index: [num_samples]
                     torch.cuda.empty_cache()
                     
                 except RuntimeError as e:
@@ -332,11 +359,23 @@ class UncertaintySampling():
                         continue
                     else:
                         raise e
-
-        all_probs = torch.cat(all_probs, dim=0)  # shape: [dataset_size, num_samples, num_classes]
-
+                    
+        # again check for empty probs
+        for i, probs in enumerate(all_probs):
+            for j, prob in enumerate(probs):
+                for k, p in enumerate(prob):
+                    if p.nelement() == 0:
+                        all_probs[i][j][k] = torch.log(torch.rand(1, model.hparams.num_classes - 1)).cpu()
+                        
         # Compute BatchBALD batch
-        candidate_batch = get_batchbald_batch(all_probs, n_train, num_samples)
+        candidate_batch = get_batchbald_batch(
+            log_probs_N_K_C = all_probs, 
+            n_train = n_train, 
+            num_samples = num_samples, 
+            num_classes = model.hparams.num_classes, 
+            batch_size=batch_size,
+            N = len(p_samples)
+        )
 
         selected_indices = [p_samples[i] for i in candidate_batch.indices]
 

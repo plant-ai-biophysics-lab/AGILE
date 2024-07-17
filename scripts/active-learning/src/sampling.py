@@ -50,7 +50,7 @@ class UncertaintySampling():
                 return self.random_sample(chunk)
         elif method == 'entropy':
             if model is None:
-                return self.random_sample(chunk = 0.01) # seed model
+                return self.random_sample(chunk = 0.2) # seed model
             else:
                 return self.entropy_based(chunk, model, dm, batch_size)
         elif method == 'entropy_cluster':

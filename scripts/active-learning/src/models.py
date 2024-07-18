@@ -92,7 +92,8 @@ class LitDetectorModel(pl.LightningModule):
     def __init__(
         self, 
         num_classes: int = 1, 
-        learning_rate: float = 2e-4
+        learning_rate: float = 2e-4,
+        device: str = 'cuda'
     ):
         """Object Detection model built with PyTorch Lightning using Faster R-CNN.
 
@@ -105,10 +106,11 @@ class LitDetectorModel(pl.LightningModule):
         # define properties
         self.hparams.lr = learning_rate
         self.hparams.num_classes = num_classes
+        self.to(device)
         
         # define the model
         backbone = fasterrcnn_resnet50_fpn().backbone
-        self.model = CustomFasterRCNN(backbone, num_classes)
+        self.model = CustomFasterRCNN(backbone, num_classes, device)
         
         # define layers
         self.fc6_dropout = nn.Dropout(p=0.5)

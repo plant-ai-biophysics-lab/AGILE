@@ -17,10 +17,13 @@ from tqdm.auto import tqdm
 ### CUSTOM FASTERRCNN CLASS ###
 class CustomFasterRCNN(FasterRCNN):
     
-    def __init__(self, backbone, num_classes):
+    def __init__(self, backbone, num_classes, device):
         super(CustomFasterRCNN, self).__init__(backbone, num_classes)
+        self.device = torch.device(device)
+        self.to(self.device)
         
-    def forward(self, images, targets=None, dropout=False):
+    def forward(self, images, targets=None, dropout=False):        
+        # Check if the model is in training mode
         if self.training:
             if targets is None:
                 torch._assert(False, "targets should not be none when in training mode")
@@ -43,11 +46,13 @@ class CustomFasterRCNN(FasterRCNN):
             self.roi_heads.box_head.fc6 = nn.Sequential(
                 self.roi_heads.box_head.fc6,
                 self.fc6_dropout
-            )
+            ).to(self.device)
             self.roi_heads.box_head.fc7 = nn.Sequential(
                 self.roi_heads.box_head.fc7,
                 self.fc7_dropout
-            )
+            ).to(self.device)
+        self.to(self.device)
+        
         outputs = super(CustomFasterRCNN, self).forward(images, targets)
         
         # check images
@@ -62,12 +67,12 @@ class CustomFasterRCNN(FasterRCNN):
         images = ImageList(images, original_image_sizes)
         
         # extract features and metrics
-        features = self.backbone(images.tensors)
+        features = self.backbone(images.tensors.to(self.device))
         if isinstance(features, torch.Tensor):
             features = OrderedDict([("0", features)])
         proposals, _ = self.rpn(images, features, targets)
-        box_features = self.roi_heads.box_roi_pool(features, proposals, images.image_sizes)
-        box_features = self.roi_heads.box_head(box_features)
+        box_features = self.roi_heads.box_roi_pool(features, proposals, images.image_sizes).to(self.device)
+        box_features = self.roi_heads.box_head(box_features).to(self.device)
         class_logits, box_regression = self.roi_heads.box_predictor(box_features)
         
         # post process class logits
@@ -110,13 +115,11 @@ class CustomFasterRCNN(FasterRCNN):
 
             # non-maximum suppression, independently done per class
             keep = box_ops.batched_nms(boxes, scores, labels, self.roi_heads.nms_thresh)
-            boxes, scores, labels, logits = boxes[keep], scores[keep], labels[keep], logits[keep] # logits shape: (num_boxes, num_classes)
+            boxes, scores, labels, logits = boxes[keep], scores[keep], labels[keep], logits[keep]
 
             # append filtered logits to all_logits
-            # all_logits.append(logits.mean(dim=0)) # TODO: Instead of averaging the logits, average the entropy values.
             all_logits.append(logits)
 
-        # all_logits = torch.stack(all_logits) # length of all_logits: [batch_size] # TODO: Aggregate all the logits different (per image).
         return outputs, all_logits
     
 ### BatchBALD Functions and Classes ###

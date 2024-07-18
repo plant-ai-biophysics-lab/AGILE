@@ -1,0 +1,29 @@
+==========================================
+SLURM_JOB_ID = 14572462
+SLURM_NODELIST = gpu-5-58
+CUDA_VISIBLE_DEVICES = 0
+==========================================
+Loaded 5717 images and 5717 labels
+
+############### Job 14572462 summary ###############
+Name                : paibl
+User                : eranario
+Account             : jmearlesgrp
+Partition           : gpum
+Nodes               : gpu-5-58
+Cores               : 8
+GPUs                : 1
+State               : CANCELLED by 1406561,CANCELLED
+ExitCode            : 0:0
+Submit              : 2024-07-17T13:38:43
+Start               : 2024-07-17T13:39:09
+End                 : 2024-07-17T13:40:33
+Reserved walltime   : 3-00:00:00
+Used walltime       :   00:01:24
+Used CPU time       :   00:00:00
+% User (Computation): --
+% System (I/O)      : --
+Mem reserved        : 120G
+Max Mem used        : 84.00K (gpu-5-58)
+Max Disk Write      : 0.00  (gpu-5-58)
+Max Disk Read       : 10.24K (gpu-5-58)

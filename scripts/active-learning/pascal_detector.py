@@ -1,6 +1,7 @@
 import argparse
 import wandb
 import glob
+import torch
 import albumentations as A
 import lightning as pl
 
@@ -24,6 +25,9 @@ def main(
 ):
     # set seed
     pl.seed_everything(42)
+   
+    # find device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # create sampling class
     transform = A.Compose([
@@ -41,6 +45,7 @@ def main(
         train_dataset, test_dataset = us.sample(chunk=chunk, method=method, model=model, dm=PASCALDataModule, batch_size=batch_size)
         # if model is None:
         model = LitDetectorModel(num_classes=20, learning_rate=lr)
+        model.to(device)
         
         # create data module
         dm = PASCALDataModule(

@@ -39,8 +39,8 @@ def main(
         
         # define sampling method and model
         train_dataset, test_dataset = us.sample(chunk=chunk, method=method, model=model, dm=PASCALDataModule, batch_size=batch_size)
-        if model is None:
-            model = LitDetectorModel(num_classes=20, learning_rate=lr)
+        # if model is None:
+        model = LitDetectorModel(num_classes=20, learning_rate=lr)
         
         # create data module
         dm = PASCALDataModule(
@@ -74,7 +74,7 @@ def main(
         ckpts = f'{logs_dir}/{prj_name}/{run_id}/checkpoints/*.ckpt'
         ckpt_path = glob.glob(ckpts)[0]
         trainer.test(ckpt_path=ckpt_path, datamodule=dm)
-        model = LitDetectorModel.load_from_checkpoint(checkpoint_path=ckpt_path)
+        # model = LitDetectorModel.load_from_checkpoint(checkpoint_path=ckpt_path)
         
         wandb.finish() # finish wandb run
         i += 1 # update index

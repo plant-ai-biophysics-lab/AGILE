@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import lightning as pl
 import torch.nn.functional as F
 import math
 
@@ -13,6 +12,7 @@ from torchvision.models.detection.image_list import ImageList
 from dataclasses import dataclass
 from toma import toma
 from tqdm.auto import tqdm
+from sklearn.metrics import pairwise_distances
 
 ### CUSTOM FASTERRCNN CLASS ###
 class CustomFasterRCNN(FasterRCNN):
@@ -569,3 +569,38 @@ class DynamicJointEntropy(JointEntropy):
     def compute_batch(self, log_probs_B_K_C: list, B:int, K:int, C:int, output_entropies_B=None) -> torch.Tensor:
         """Computes the joint entropy of the added variables together with the batch (one by one)."""
         return self.inner.compute_batch(log_probs_B_K_C, B, K, C, output_entropies_B)
+    
+### Core-sets by k Greedy Centers ###
+class kCenterGreedy:
+    def __init__(self, X, metric='euclidean'):
+        self.X = X
+        self.metric = metric
+        self.min_distances = None
+        self.already_selected = []
+
+    def update_distances(self, cluster_centers, only_new=True, reset_dist=False):
+        if reset_dist:
+            self.min_distances = None
+        if only_new:
+            cluster_centers = [d for d in cluster_centers if d not in self.already_selected]
+        if len(cluster_centers) > 0: 
+            x = self.X[cluster_centers]
+            dist = pairwise_distances(self.X, x, metric=self.metric)
+            if self.min_distances is None:
+                self.min_distances = np.min(dist, axis=1).reshape(-1, 1)
+            else:
+                self.min_distances = np.minimum(self.min_distances, dist)
+
+    def select_batch(self, already_selected, N):
+        self.update_distances(already_selected, only_new=False, reset_dist=True)
+        new_batch = []
+        for _ in range(N):
+            if len(already_selected) == 0:
+                ind = np.random.choice(np.arange(self.X.shape[0]))
+            else:
+                ind = np.argmax(self.min_distances)
+            assert ind not in already_selected
+            self.update_distances([ind], only_new=True, reset_dist=False)
+            new_batch.append(ind)
+        self.already_selected = np.concatenate((already_selected, np.array(new_batch)))
+        return new_batch

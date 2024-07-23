@@ -8,7 +8,7 @@ import lightning as pl
 from albumentations.pytorch import ToTensorV2
 from src.data import PASCALDataModule, PASCALDataset
 from src.models import LitDetectorModel
-from src.sampling import UncertaintySampling
+from src.sampling import ActiveSampling
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
@@ -35,14 +35,14 @@ def main(
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
-    us = UncertaintySampling(
+    AS = ActiveSampling(
         dataset=PASCALDataset(root_dir=root_dir, split='train', transform=transform))
     model = None
     
     for i in range(rounds):
         
         # define sampling method and model
-        train_dataset, test_dataset = us.sample(chunk=chunk, method=method, model=model, dm=PASCALDataModule, batch_size=batch_size)
+        train_dataset, test_dataset = AS.sample(chunk=chunk, method=method, model=model, dm=PASCALDataModule, batch_size=batch_size)
         # if model is None:
         model = LitDetectorModel(num_classes=20, learning_rate=lr, device=device)
         

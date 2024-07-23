@@ -188,7 +188,6 @@ class LitDetectorModel(pl.LightningModule):
         for logit in logits:
             prob = F.softmax(logit, dim=-1)
             probs.append(prob)
-        # probs = F.softmax(logits, dim=-1) # TODO: Since there will be mutiple boxes per image, this might change.
         
         # check for NaNs in probs and replace them with random probabilities
         for i, prob in enumerate(probs):
@@ -219,3 +218,14 @@ class LitDetectorModel(pl.LightningModule):
     def _return_model(self):
         self.model.roi_heads.box_head.fc6 = self.model.roi_heads.box_head.fc6[0]
         self.model.roi_heads.box_head.fc7 = self.model.roi_heads.box_head.fc7[0]
+        
+    def extract_features(self, batch):
+        
+        # confirm model and batch to device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.backbone.to(device)
+        
+        x = batch
+        features = self.model.backbone(x)
+        
+        return features['pool']

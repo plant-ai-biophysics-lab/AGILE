@@ -1,6 +1,3 @@
-import sys
-sys.setrecursionlimit(1000000)  # Set this to a higher value
-
 import random
 import torch
 import math
@@ -10,12 +7,11 @@ import numpy as np
 
 from torch.utils.data import Subset, DataLoader
 from sklearn.cluster import KMeans
-from typing import List
 from sklearn.impute import SimpleImputer
-from src.util import get_batchbald_batch
+from src.util import get_batchbald_batch, kCenterGreedy
 from tqdm import tqdm
 
-class UncertaintySampling():
+class ActiveSampling():
     """Active learning class for uncertainty sampling
     
     """
@@ -64,6 +60,11 @@ class UncertaintySampling():
                 return self.random_sample(chunk = 0.1) # seed model
             else:
                 return self.BatchBALD(chunk, model, dm, batch_size)
+        elif method == 'kcenter':
+            if model is None:
+                return self.random_sample(chunk = 0.1)
+            else:
+                return self.kcenter_greedy(chunk, batch_size, model, dm)
         else:
             raise ValueError("Invalid sampling method.")
         
@@ -149,8 +150,8 @@ class UncertaintySampling():
                         normalized_entropy = torch.mean(normalized_entropy, dim=0) # average the entropy of all the detections in each image [1 number]
                         normalized_entropy = np.array([normalized_entropy.cpu()])
                 else:
-                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) # TODO: Calculate the entropy per box of each image.
-                    normalized_entropy = raw_entropy / math.log2(probs.size(1))       # TODO: Average the entropy of all the boxes in each image.
+                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) 
+                    normalized_entropy = raw_entropy / math.log2(probs.size(1)) 
                     normalized_entropy = np.array([normalized_entropy.cpu()])
                 entropies.extend(normalized_entropy)
                 indices.extend([available_indices[i] for i in range(len(inputs))])
@@ -218,8 +219,8 @@ class UncertaintySampling():
                         normalized_entropy = torch.mean(normalized_entropy, dim=0) # average the entropy of all the detections in each image [1 number]
                         normalized_entropy = np.array([normalized_entropy.cpu()])
                 else:
-                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1) # TODO: Calculate the entropy per box of each image.
-                    normalized_entropy = raw_entropy / math.log2(probs.size(1))       # TODO: Average the entropy of all the boxes in each image.
+                    raw_entropy = -torch.sum(probs * torch.log2(probs + 1e-5), dim=1)
+                    normalized_entropy = raw_entropy / math.log2(probs.size(1))
                     normalized_entropy = np.array([normalized_entropy.cpu()])
                     
                 # format logits if it is a list (e.g. for object detection)
@@ -339,7 +340,7 @@ class UncertaintySampling():
                     batch_probs = []
                     for _ in range(num_samples):
                         _, probs = model.predict_step(inputs.clone(), dropout=True)  # length: batch_size / shape for each index: (num_detections, num_classes)
-                        # log_probs = torch.log(probs) # TODO: dimensions of probs could be different
+                        # log_probs = torch.log(probs)
                         # replace probs with random probs if empty
                         for prob in probs:
                             if prob.nelement() == 0:
@@ -401,3 +402,61 @@ class UncertaintySampling():
     @classmethod
     def get_used_samples(cls):
         return cls.used_samples
+
+    def kcenter_greedy(
+        self,
+        chunk: float,
+        batch_size: int = 24,
+        model: pl.LightningModule = None, 
+        dm: pl.LightningDataModule = None
+    ):
+        
+        # get available samples
+        used_samples = self.get_used_samples()
+        if chunk < 1.0:
+            n_train = int(len(self.dataset) * chunk)
+            all_indices = set(range(len(self.dataset)))
+            available_indices = list(all_indices - set(used_samples))
+            
+            if len(available_indices) < n_train:
+                raise ValueError("Not enough available indices to sample the required number of examples.")
+            
+        # prepare subset of samples for prediction
+        subset = Subset(self.dataset, available_indices)
+        if dm:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
+        else:
+            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        model.eval()
+        
+        # extract features for kgreedy
+        features_list = []
+        with torch.no_grad():
+            for batch in dataloader:
+                inputs, _ = batch
+                inputs = inputs.to(self.device)
+                features = model.extract_features(inputs)
+                features_list.append(features.view(features.size(0), -1))
+                
+        # concatenate features
+        features = torch.cat(features_list, dim=0).cpu().numpy()
+        
+        # initialize k-center greedy
+        k_center_greedy = kCenterGreedy(features)
+        selected_indices = k_center_greedy.select_batch(
+            already_selected=np.array(used_samples),
+            N = n_train
+            )
+        selected_indices  = [available_indices[i] for i in selected_indices]
+        
+        # update used samples
+        self.set_used_samples(used_samples + selected_indices)
+        
+        # create the new dataset with the selected samples (train set)
+        train_dataset = Subset(self.dataset, used_samples + selected_indices)
+        
+        # create the new dataset with the remaining samples (pool set)
+        unselected_indices = list(all_indices - set(used_samples + selected_indices))
+        test_dataset = Subset(self.dataset, unselected_indices)
+        
+        return train_dataset, test_dataset

@@ -422,11 +422,12 @@ class ActiveSampling():
                 raise ValueError("Not enough available indices to sample the required number of examples.")
             
         # prepare subset of samples for prediction
-        subset = Subset(self.dataset, available_indices)
-        if dm:
-            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
-        else:
-            dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        # subset = Subset(self.dataset, available_indices)
+        # if dm:
+        #     dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
+        # else:
+        #     dataloader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=False, collate_fn=dm.collate_fn)
         model.eval()
         
         # extract features for kgreedy
@@ -443,9 +444,7 @@ class ActiveSampling():
         
         # initialize k-center greedy
         k_center_greedy = kCenterGreedy(X = features, already_selected = used_samples)
-        selected_indices = k_center_greedy.select_batch(
-            N = n_train
-            )
+        selected_indices = k_center_greedy.select_batch(N = n_train)
         selected_indices  = [available_indices[i] for i in selected_indices]
         
         # update used samples

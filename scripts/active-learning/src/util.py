@@ -598,9 +598,13 @@ class kCenterGreedy:
             if len(self.already_selected) == 0:
                 ind = np.random.choice(np.arange(self.X.shape[0]))
             else:
-                ind = np.argmax(self.min_distances)
-            assert ind not in self.already_selected
+                # Temporarily set distances of already selected indices to -infinity
+                distances = self.min_distances.copy()
+                distances[self.already_selected] = -np.inf
+                ind = np.argmax(distances)  # Now correctly using argmax
+            if ind in self.already_selected:
+                raise ValueError("Selected index is already in 'already_selected'. This should not happen.")
             self.update_distances([ind], only_new=True, reset_dist=False)
             new_batch.append(ind)
-        # self.already_selected = np.concatenate((already_selected, np.array(new_batch)))
+            self.already_selected.append(ind)  # Ensure the selected index is marked as selected
         return new_batch

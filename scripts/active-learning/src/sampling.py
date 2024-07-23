@@ -445,7 +445,7 @@ class ActiveSampling():
         # initialize k-center greedy
         k_center_greedy = kCenterGreedy(X = features, already_selected = used_samples)
         selected_indices = k_center_greedy.select_batch(N = n_train)
-        selected_indices  = [available_indices[i] for i in selected_indices]
+        # selected_indices  = [available_indices[i] for i in selected_indices]
         
         # update used samples
         self.set_used_samples(used_samples + selected_indices)

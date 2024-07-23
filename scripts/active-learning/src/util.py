@@ -572,11 +572,11 @@ class DynamicJointEntropy(JointEntropy):
     
 ### Core-sets by k Greedy Centers ###
 class kCenterGreedy:
-    def __init__(self, X, metric='euclidean'):
+    def __init__(self, X, already_selected, metric='euclidean'):
         self.X = X
         self.metric = metric
         self.min_distances = None
-        self.already_selected = []
+        self.already_selected = already_selected
 
     def update_distances(self, cluster_centers, only_new=True, reset_dist=False):
         if reset_dist:
@@ -591,16 +591,16 @@ class kCenterGreedy:
             else:
                 self.min_distances = np.minimum(self.min_distances, dist)
 
-    def select_batch(self, already_selected, N):
-        self.update_distances(already_selected, only_new=False, reset_dist=True)
+    def select_batch(self, N):
+        self.update_distances(self.already_selected, only_new=False, reset_dist=True)
         new_batch = []
         for _ in range(N):
-            if len(already_selected) == 0:
+            if len(self.already_selected) == 0:
                 ind = np.random.choice(np.arange(self.X.shape[0]))
             else:
                 ind = np.argmax(self.min_distances)
-            assert ind not in already_selected
+            assert ind not in self.already_selected
             self.update_distances([ind], only_new=True, reset_dist=False)
             new_batch.append(ind)
-        self.already_selected = np.concatenate((already_selected, np.array(new_batch)))
+        # self.already_selected = np.concatenate((already_selected, np.array(new_batch)))
         return new_batch

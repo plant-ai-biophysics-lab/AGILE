@@ -41,28 +41,28 @@ class ActiveSampling():
         """
         if method == 'random':
             if model is None:
-                return self.random_sample(chunk = 0.1) # seed model
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.random_sample(chunk)
         elif method == 'entropy':
             if model is None:
-                return self.random_sample(chunk = 0.1) # seed model
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.entropy_based(chunk, model, dm, batch_size)
         elif method == 'entropy_cluster':
             if model is None:
-                return self.random_sample(chunk = 0.1) # seed model
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.entropy_cluster_based(chunk, model, dm, batch_size, 
                                                   num_clusters=20, max_iter=20)
         elif method == 'BatchBALD':
             if model is None:
-                return self.random_sample(chunk = 0.1) # seed model
+                return self.random_sample(chunk = 0.5) # seed model
             else:
                 return self.BatchBALD(chunk, model, dm, batch_size)
         elif method == 'kcenter':
             if model is None:
-                return self.random_sample(chunk = 0.1)
+                return self.random_sample(chunk = 0.5)
             else:
                 return self.kcenter_greedy(chunk, batch_size, model, dm)
         else:

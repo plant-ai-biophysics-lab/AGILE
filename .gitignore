@@ -1,3 +1,4 @@
 bash/
 scripts/active-learning/src/__pycache__
 scripts/active-learning/farm
+*__pycache__

@@ -48,7 +48,6 @@ class ControlNetDataset(Dataset):
 
         source_image_path = os.path.join(self.source_images_path, source_image_file)
         target_image_path = os.path.join(self.target_images_path, target_image_file)
-        label_path = os.path.join(self.labels_path, source_image_file.replace('jpg', 'txt').replace('jpeg', 'txt').replace('png', 'txt'))
         
         # Load images
         source_image = Image.open(source_image_path).convert("RGB")
@@ -64,13 +63,5 @@ class ControlNetDataset(Dataset):
             
             # Normalize target images to [-1, 1]
             target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
-        
-        # Load label if necessary
-        labels = []
-        with open(label_path, 'r') as f:
-            for line in f:
-                label = list(map(float, line.strip().split()))
-                labels.append(label)
-        labels = torch.tensor(labels)
 
         return dict(jpg=target_image, txt=prompt, hint=source_image)

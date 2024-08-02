@@ -1,9 +1,9 @@
 import torch
-import tqdm
 import os
 import numpy as np
 import torch.nn.functional as F
 
+from tqdm import tqdm
 from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any

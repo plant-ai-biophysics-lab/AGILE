@@ -1,6 +1,7 @@
 import importlib
 import torch
 import math
+import os
 import numpy as np
 import torch.nn as nn
 
@@ -30,6 +31,20 @@ def create_model(config_path):
     model = instantiate_from_config(config.model).cpu()
     print(f'Loaded model config from [{config_path}]')
     return model
+
+def get_state_dict(d):
+    return d.get('state_dict', d)
+
+def load_state_dict(ckpt_path, location='cpu'):
+    _, extension = os.path.splitext(ckpt_path)
+    if extension.lower() == ".safetensors":
+        import safetensors.torch
+        state_dict = safetensors.torch.load_file(ckpt_path, device=location)
+    else:
+        state_dict = get_state_dict(torch.load(ckpt_path, map_location=torch.device(location)))
+    state_dict = get_state_dict(state_dict)
+    print(f'Loaded state_dict from [{ckpt_path}]')
+    return state_dict
 
 def exists(x):
     return x is not None
@@ -249,3 +264,8 @@ def normalization(channels):
     :return: an nn.Module for normalization.
     """
     return GroupNorm32(32, channels)
+
+class PermuteTransform:
+    def __call__(self, x):
+        # Permute dimensions from [3, 416, 416] to [416, 3, 416]
+        return x.permute(2, 1, 0)

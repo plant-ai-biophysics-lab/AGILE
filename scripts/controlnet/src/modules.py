@@ -7,7 +7,7 @@ from tqdm import tqdm
 from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTokenizer, CLIPTextModel, SamProcessor, SamModel
 
 from src.util import default, exists, extract_into_tensor, noise_like, zero_module, checkpoint
 
@@ -21,6 +21,83 @@ except:
     
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
+class SAM(nn.Module):
+    def __init__(self, type="facebook/sam-vit-huge"):
+        super().__init__()
+        
+        # Load SAM model and processor
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = SamProcessor.from_pretrained(type)
+        self.model = SamModel.from_pretrained(type).to("cpu")  # Initially keep the model on CPU
+        
+    @staticmethod
+    def load_yolo_annotations(yolo_file):
+        with open(yolo_file, 'r') as file:
+            annotations = file.readlines()
+        bboxes = []
+        for annotation in annotations:
+            parts = annotation.strip().split()
+            x_center, y_center, width, height = map(float, parts[1:])
+            bboxes.append((x_center, y_center, width, height))
+        return bboxes
+    
+    @staticmethod
+    def create_binary_mask(mask, bboxes):
+        binary_mask = np.zeros(mask.shape, dtype=np.uint8)
+        for bbox in bboxes:
+            x_center, y_center, width, height = bbox
+            left = int((x_center - width / 2) * mask.shape[1])
+            right = int((x_center + width / 2) * mask.shape[1])
+            top = int((y_center - height / 2) * mask.shape[0])
+            bottom = int((y_center + height / 2) * mask.shape[0])
+            
+            # Mask within the bounding box
+            binary_mask[top:bottom, left:right] = mask[top:bottom, left:right] == 1
+
+        return binary_mask
+    
+    def forward(self, image, yolo_file):
+        bboxes = self.load_yolo_annotations(yolo_file)
+        
+        # Prepare the image and bounding boxes for SAM
+        input_points = []
+        input_labels = []
+        for bbox in bboxes:
+            x_center, y_center, width, height = bbox
+            x = x_center * image.shape[1]
+            y = y_center * image.shape[0]
+            input_points.append([x, y])
+            input_labels.append(1)  # Positive label for foreground
+
+        inputs = self.processor(image, input_points=[input_points], input_labels=[input_labels], return_tensors="pt").to(self.device)
+
+        # Move the model to the device for the forward pass
+        self.model.to(self.device)
+        
+        # Perform segmentation
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        # Move the model back to CPU
+        self.model.to("cpu")
+
+        # Get the segmentation masks
+        masks = self.processor.image_processor.post_process_masks(
+            outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
+        )[0]  # Get the first batch
+
+        # Ensure the mask is 2D
+        masks = masks.squeeze().numpy()  # Squeeze to remove extra dimensions
+        if masks.ndim == 3 and masks.shape[0] == 1:  # Handle case where mask has extra channel dimension
+            masks = masks[0]
+        elif masks.ndim == 3 and masks.shape[0] == 3:  # If mask has three channels, convert to grayscale
+            masks = np.mean(masks, axis=0)
+
+        # Create the binary mask
+        binary_mask = self.create_binary_mask(masks, bboxes)
+
+        return binary_mask
+        
 class AbstractEncoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1103,21 +1180,49 @@ class SpatialTransformer(nn.Module):
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, list):
             context = [context]
+            
         b, c, h, w = x.shape
         x_in = x
         x = self.norm(x)
+        
         if not self.use_linear:
             x = self.proj_in(x)
+            
         x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+        
         if self.use_linear:
             x = self.proj_in(x)
+        
+        # processed_context = []
+        # for ctx in context:
+        #     if ctx is not None and len(ctx.shape) == 4:
+        #         ctx = self.norm(ctx)
+                
+        #         if not self.use_linear:
+        #             ctx = self.proj_in(ctx)
+                    
+        #         ctx = rearrange(ctx, 'b c h w -> b (h w) c').contiguous()
+                
+        #         if self.use_linear:
+        #             ctx = self.proj_in(ctx)
+                    
+        #         processed_context.append(ctx)
+        #     else:
+        #         processed_context.append(ctx)
+        
         for i, block in enumerate(self.transformer_blocks):
-            x = block(x, context=context[i])
+            context_i = rearrange(context[i], 'b c h w -> b (h w) c').contiguous() if context[i] is not None else None
+            # x = block(x, context=context[i])
+            x = block(x, context=context_i)
+        
         if self.use_linear:
             x = self.proj_out(x)
+        
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        
         if not self.use_linear:
             x = self.proj_out(x)
+        
         return x + x_in
 
 class LitEma(nn.Module):

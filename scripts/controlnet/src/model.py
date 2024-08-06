@@ -1504,7 +1504,7 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: target c: txt
+        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: target c: mask
         control = batch[self.control_key] # control: hint (condition)
         if bs is not None:
             control = control[:bs]
@@ -1530,7 +1530,8 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
-        return self.get_learned_conditioning([""] * N)
+        # return self.get_learned_conditioning([""] * N)
+        return self.get_learned_conditioning(torch.zeros([N, 1, 512, 512]).to(self.device))
 
     @torch.no_grad()
     def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
@@ -1547,7 +1548,8 @@ class ControlLDM(LatentDiffusion):
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
         log["control"] = c_cat * 2.0 - 1.0
-        log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
+        # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
+        log["conditioning"] = self.decode_first_stage(c)
 
         if plot_diffusion_rows:
             # get diffusion row
@@ -1578,7 +1580,7 @@ class ControlLDM(LatentDiffusion):
                 denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
                 log["denoise_row"] = denoise_grid
 
-        if unconditional_guidance_scale > 1.0:
+        if unconditional_guidance_scale > 0.0:
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
@@ -1903,13 +1905,8 @@ class ControlNet(nn.Module):
 
         h = x.type(self.dtype)
         for module, zero_conv in zip(self.input_blocks, self.zero_convs):
-            if guided_hint is not None:
-                h = module(h, emb, context)
-
-                # # Resize guided_hint to match the shape of h
-                # if guided_hint.shape != h.shape:
-                #     guided_hint = F.interpolate(guided_hint, size=h.shape[2:], mode='nearest')
-                #     # print(f"Resized guided_hint shape: {guided_hint.shape}")
+            if guided_hint is not None: # for adding hint and condition
+                h = module(h, emb, context=None)
                 
                 h += guided_hint
                 guided_hint = None

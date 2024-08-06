@@ -10,6 +10,14 @@ from omegaconf import OmegaConf
 from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
 
+def initialize_weights(tensor):
+    if tensor.ndimension() == 2:  # Check if the tensor is a linear layer weight
+        nn.init.kaiming_normal_(tensor)
+    elif tensor.ndimension() == 4:  # Check if the tensor is a conv layer weight
+        nn.init.kaiming_normal_(tensor)
+    else:
+        nn.init.constant_(tensor, 0)
+
 def instantiate_from_config(config):
     if not "target" in config:
         if config == '__is_first_stage__':

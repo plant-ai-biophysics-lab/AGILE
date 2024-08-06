@@ -5,12 +5,14 @@ import numpy as np
 
 from torch.utils.data import Dataset
 from PIL import Image
+from src.modules import SAM
 
 class ControlNetDataset(Dataset):
     def __init__(self, source_images_path, target_images_path, transform=None):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
         self.transform = transform
+        self.sam_model = SAM()
         
         # Load image file paths
         self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
@@ -25,7 +27,8 @@ class ControlNetDataset(Dataset):
             self.data.append({
                 'source': source_file,
                 'target': target_file,
-                'prompt': ''  # Empty string prompt
+                'prompt': '', # empty prompt
+                'control': None # placeholder for control
             })
     
     def balance_dataset_lengths(self):
@@ -63,5 +66,13 @@ class ControlNetDataset(Dataset):
             
             # Normalize target images to [-1, 1]
             target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
+            
+        # Get segmentation mask
+        yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
+        if os.path.exists(yolo_file):
+            mask = self.sam_model(source_image, yolo_file)
+        else:
+            mask = np.zeros(source_image.shape[:2], dtype=np.uint8)
 
-        return dict(jpg=target_image, txt=prompt, hint=source_image)
+        # return dict(jpg=target_image, txt=prompt, hint=source_image)
+        return dict(jpg=target_image, txt=prompt, control=mask, hint=source_image)

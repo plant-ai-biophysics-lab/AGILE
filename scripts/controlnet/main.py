@@ -1,11 +1,13 @@
 import argparse
+import torch
 import pytorch_lightning as pl
 
 from pathlib import Path
 from torchvision import transforms
 from torch.utils.data import DataLoader
+from torch import nn
 
-from src.util import create_model, load_state_dict, PermuteTransform
+from src.util import create_model, load_state_dict, PermuteTransform, initialize_weights
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
 
@@ -13,7 +15,17 @@ def main(args):
     
     # create model from config and load from chkpt
     model = create_model(args.model_config).cpu()
-    model.load_state_dict(load_state_dict(args.checkpoint, location='cpu'))
+    state_dict = load_state_dict(args.checkpoint, location='cpu')
+    for name, param in model.named_parameters():
+        if name in state_dict:
+            if state_dict[name].shape != param.shape:
+                # print(f"Mismatch found in {name}: checkpoint shape {state_dict[name].shape}, model shape {param.shape}")
+                # Initialize new weights
+                initialize_weights(param.data)
+                # Remove mismatched parameter from state_dict
+                del state_dict[name]
+    model.load_state_dict(state_dict, strict=False)
+                
     model.learning_rate = args.learning_rate
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
@@ -43,7 +55,8 @@ def main(args):
         max_epochs=args.epochs,
         default_root_dir=args.logs_dir,
         precision = 32,
-        callbacks = [logger]
+        callbacks = [logger],
+        accumulate_grad_batches=args.batch_size*4,
     )
     trainer.fit(model, dataloader)
     
@@ -58,7 +71,7 @@ if __name__ == "__main__":
                     help = "Learning rate for the model.")
     ap.add_argument("--sd_locked", action="store_true",
                     help="If set, stable diffusion decoder will be locked.")
-    ap.add_argument("--only_mid_control", action="store_false",
+    ap.add_argument("--only_mid_control", type=bool, default=False,
                     help="If set, only mid control of ControlNet will be used.")
     ap.add_argument("--source_images_path", type=Path, required=True,
                     help="Path to source images.")

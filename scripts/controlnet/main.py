@@ -14,17 +14,19 @@ from src.logger import ImageLogger
 def main(args):
     
     # create model from config and load from chkpt
+    mismatch_count = 0
+    total_count = 0
     model = create_model(args.model_config).cpu()
     state_dict = load_state_dict(args.checkpoint, location='cpu')
     for name, param in model.named_parameters():
+        total_count += 1
         if name in state_dict:
             if state_dict[name].shape != param.shape:
-                # print(f"Mismatch found in {name}: checkpoint shape {state_dict[name].shape}, model shape {param.shape}")
-                # Initialize new weights
+                mismatch_count += 1
                 initialize_weights(param.data)
-                # Remove mismatched parameter from state_dict
                 del state_dict[name]
     model.load_state_dict(state_dict, strict=False)
+    print(f"Mismatches: {mismatch_count} out of {total_count}")
                 
     model.learning_rate = args.learning_rate
     model.sd_locked = args.sd_locked
@@ -56,7 +58,7 @@ def main(args):
         default_root_dir=args.logs_dir,
         precision = 32,
         callbacks = [logger],
-        accumulate_grad_batches=args.batch_size*4,
+        # accumulate_grad_batches=args.batch_size*4,
     )
     trainer.fit(model, dataloader)
     

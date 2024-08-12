@@ -17,16 +17,17 @@ def main(args):
     mismatch_count = 0
     total_count = 0
     model = create_model(args.model_config).cpu()
-    state_dict = load_state_dict(args.checkpoint, location='cpu')
-    for name, param in model.named_parameters():
-        total_count += 1
-        if name in state_dict:
-            if state_dict[name].shape != param.shape:
-                mismatch_count += 1
-                initialize_weights(param.data)
-                del state_dict[name]
-    model.load_state_dict(state_dict, strict=False)
-    print(f"Mismatches: {mismatch_count} out of {total_count}")
+    if args.checkpoint:
+        state_dict = load_state_dict(args.checkpoint, location='cpu')
+        for name, param in model.named_parameters():
+            total_count += 1
+            if name in state_dict:
+                if state_dict[name].shape != param.shape:
+                    mismatch_count += 1
+                    initialize_weights(param.data)
+                    del state_dict[name]
+        model.load_state_dict(state_dict, strict=False)
+        print(f"Mismatches: {mismatch_count} out of {total_count}")
                 
     model.learning_rate = args.learning_rate
     model.sd_locked = args.sd_locked
@@ -65,7 +66,7 @@ def main(args):
 if __name__ == "__main__":
     
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", type=Path, required=True,
+    ap.add_argument("--checkpoint", type=Path, default=None,
                     help="Path to pretrained model (stable diffusion with controlnet).")
     ap.add_argument("--model_config", type=Path, required=True,
                     help="Path to model config file (yaml file in models folder).")

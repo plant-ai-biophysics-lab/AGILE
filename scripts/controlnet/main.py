@@ -59,7 +59,7 @@ def main(args):
         default_root_dir=args.logs_dir,
         precision = 32,
         callbacks = [logger],
-        # accumulate_grad_batches=args.batch_size*4,
+        accumulate_grad_batches=args.batch_size*4,
     )
     trainer.fit(model, dataloader)
     

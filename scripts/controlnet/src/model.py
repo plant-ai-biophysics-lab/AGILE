@@ -1011,6 +1011,17 @@ class LatentDiffusion(DDPM):
 
         z = 1. / self.scale_factor * z
         return self.first_stage_model.decode(z)
+    
+    @torch.no_grad()
+    def decode_cond_stage(self, z, predict_cids=False, force_not_quantize=False):
+        if predict_cids:
+            if z.dim() == 4:
+                z = torch.argmax(z.exp(), dim=1).long()
+            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
+            z = rearrange(z, 'b h w c -> b c h w').contiguous()
+
+        z = 1. / self.scale_factor * z
+        return self.cond_stage_model.decode(z)
 
     @torch.no_grad()
     def encode_first_stage(self, x):
@@ -1549,7 +1560,7 @@ class ControlLDM(LatentDiffusion):
         log["reconstruction"] = self.decode_first_stage(z)
         log["control"] = c_cat * 2.0 - 1.0
         # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
-        log["conditioning"] = self.decode_first_stage(c)
+        log["conditioning"] = self.decode_cond_stage(c)
 
         if plot_diffusion_rows:
             # get diffusion row

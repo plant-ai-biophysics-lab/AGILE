@@ -27,8 +27,8 @@ class ImageLogger(Callback):
     def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
         root = os.path.join(save_dir, "image_log", split)
         for k in images:
-            if "samples" not in k:
-                continue  # Skip keys that do not contain "samples"
+            # if "samples" not in k:
+            #     continue  # Skip keys that do not contain "samples"
             grid = torchvision.utils.make_grid(images[k], nrow=4)
             if self.rescale:
                 grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
@@ -56,8 +56,8 @@ class ImageLogger(Callback):
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
 
             for k in images:
-                if "samples" not in k:
-                    continue  # Skip keys that do not contain "samples"
+                # if "samples" not in k:
+                #     continue  # Skip keys that do not contain "samples"
                 N = min(images[k].shape[0], self.max_images)
                 images[k] = images[k][:N]
                 if isinstance(images[k], torch.Tensor):

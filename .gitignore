@@ -1,4 +1,6 @@
 bash/
 scripts/active-learning/src/__pycache__
-scripts/active-learning/farm
-*__pycache__
+scripts/active-learning/farm/
+farm
+/scripts/controlnet/src/__pycache__/*
+/scripts/controlnetplus/src/__pycache__/*

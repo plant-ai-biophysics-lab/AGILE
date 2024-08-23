@@ -55,24 +55,26 @@ class ControlNetDataset(Dataset):
         # Load images
         source_image = Image.open(source_image_path).convert("RGB")
         target_image = Image.open(target_image_path).convert("RGB")
+            
+        # Get segmentation mask
+        yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
+        if os.path.exists(yolo_file):
+            mask = self.sam_model(np.array(source_image), yolo_file)
+            mask = np.expand_dims(mask, axis=2)
+            mask = np.repeat(mask, 3, axis=2)
+        else:
+            mask = np.zeros(source_image.shape[:2] + (3,), dtype=np.uint8)
         
         # Apply transformations if any
         if self.transform:
             source_image = self.transform(source_image)
             target_image = self.transform(target_image)
-        else:
-            # Normalize source images to [0, 1]
-            source_image = np.array(source_image).astype(np.float32) / 255.0
+            mask = self.transform(Image.fromarray(mask))
             
-            # Normalize target images to [-1, 1]
-            target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
-            
-        # Get segmentation mask
-        yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
-        if os.path.exists(yolo_file):
-            mask = self.sam_model(source_image, yolo_file)
-        else:
-            mask = np.zeros(source_image.shape[:2], dtype=np.uint8)
+        # Normalize images
+        # mask = np.array(mask).astype(np.float32) / 255.0
+        source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
+        target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
 
         # return dict(jpg=target_image, txt=prompt, hint=source_image)
         return dict(jpg=target_image, txt=prompt, control=mask, hint=source_image)

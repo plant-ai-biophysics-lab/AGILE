@@ -32,11 +32,11 @@ def main(args):
     model.learning_rate = args.learning_rate
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
+    model.parameterization = args.param
     
     # prepare dataset and dataloader
     transform = transforms.Compose([
         transforms.Resize((512, 512)),
-        transforms.ToTensor(),
         PermuteTransform()
     ])
     dataset = ControlNetDataset(
@@ -88,6 +88,8 @@ if __name__ == "__main__":
                     help="Number of epochs for training.")
     ap.add_argument("--logs_dir", type=Path, default="logs",
                     help="Directory to save logs.")
+    ap.add_argument("--param", type=str, default="eps",
+                    help="Parameterization for calculation loss: x0, eps, v.")
     args = ap.parse_args()
     
     main(args)

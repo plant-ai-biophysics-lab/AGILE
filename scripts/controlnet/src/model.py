@@ -535,7 +535,8 @@ class DDPM(pl.LightningModule):
                                   return_intermediates=return_intermediates)
 
     def q_sample(self, x_start, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
+        if noise is None:
+            noise = default(noise, lambda: torch.randn_like(x_start))
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
 
@@ -957,6 +958,15 @@ class LatentDiffusion(DDPM):
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach() # shape: (bs, c, h, w)
+        
+        # encode hint also for forward noising process
+        if 'hint' in batch.keys():
+            xy = super().get_input(batch, 'hint')
+            xy = xy.to(self.device)
+            hint_encoder_posterior = self.encode_first_stage(xy)
+            y = self.get_first_stage_encoding(hint_encoder_posterior).detach()
+        else:
+            y = None
 
         if self.model.conditioning_key is not None and not self.force_null_conditioning:
             if cond_key is None:
@@ -991,7 +1001,7 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
-        out = [z, c]
+        out = [z, c, y]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -1028,12 +1038,12 @@ class LatentDiffusion(DDPM):
         return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, c)
+        x, y, c = self.get_input(batch, self.first_stage_key)
+        loss = self(x, y, c)
         return loss
 
-    def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long() # timestep
+    def forward(self, x, y, c, *args, **kwargs):
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long() 
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
@@ -1041,7 +1051,7 @@ class LatentDiffusion(DDPM):
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, y, c, t, *args, **kwargs)
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
         if isinstance(cond, dict):
@@ -1078,9 +1088,13 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+    def p_losses(self, x_start, y_start, cond, t, noise=None):
+        # noise = default(noise, lambda: torch.randn_like(x_start))
+        # x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        
+        # apply noise from synthetic image
+        noise = y_start
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
         model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
@@ -1515,14 +1529,15 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: target c: mask
+        x, c, y = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: target c: mask
         control = batch[self.control_key] # control: hint (condition)
         if bs is not None:
             control = control[:bs]
         control = control.to(self.device)
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+        # return x, dict(c_crossattn=[c], c_concat=None)
+        return x, y, dict(c_crossattn=[c], c_concat=[control]) # c_crossattn: condition / c_concat: hint (synthetic)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         assert isinstance(cond, dict)
@@ -1542,7 +1557,7 @@ class ControlLDM(LatentDiffusion):
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
         # return self.get_learned_conditioning([""] * N)
-        return self.get_learned_conditioning(torch.zeros([N, 1, 512, 512]).to(self.device))
+        return self.get_learned_conditioning(torch.zeros([N, 3, 512, 512]).to(self.device))
 
     @torch.no_grad()
     def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
@@ -1553,12 +1568,16 @@ class ControlLDM(LatentDiffusion):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+        z, y, c = self.get_input(batch, self.first_stage_key, bs=N)
+        if c["c_concat"] is not None:
+            c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+            # log["control"] = c_cat * 2.0 - 1.0
+            log["control"] = c_cat
+        else:
+            c_cat, c = None, c["c_crossattn"][0][:N]
         N = min(z.shape[0], N)
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
-        log["control"] = c_cat * 2.0 - 1.0
         # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
         log["conditioning"] = self.decode_cond_stage(c)
 
@@ -1600,6 +1619,7 @@ class ControlLDM(LatentDiffusion):
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
                                              unconditional_conditioning=uc_full,
+                                             input_y = y
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
@@ -1609,7 +1629,10 @@ class ControlLDM(LatentDiffusion):
     @torch.no_grad()
     def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
         ddim_sampler = DDIMSampler(self)
-        b, c, h, w = cond["c_concat"][0].shape
+        if cond["c_concat"][0] is not None:
+            b, _, h, w = cond["c_concat"][0].shape
+        else:
+            b, _, h, w = cond["c_crossattn"][0].shape
         shape = (self.channels, h // 8, w // 8)
         samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, **kwargs)
         return samples, intermediates

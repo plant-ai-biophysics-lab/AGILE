@@ -222,7 +222,9 @@ class DDIMSampler(object):
                ):
         if conditioning is not None:
             if isinstance(conditioning, dict):
-                ctmp = conditioning[list(conditioning.keys())[0]]
+                ctmp = conditioning[list(conditioning.keys())[0]][0]
+                if ctmp is None:
+                    ctmp = conditioning[list(conditioning.keys())[1]][0]
                 while isinstance(ctmp, list): ctmp = ctmp[0]
                 cbs = ctmp.shape[0]
                 if cbs != batch_size:
@@ -243,6 +245,9 @@ class DDIMSampler(object):
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
+        # decoded synthetic image
+        x_T = kwargs['input_y'] if 'input_y' in kwargs else None
+        
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
                                                     img_callback=img_callback,
@@ -337,9 +342,12 @@ class DDIMSampler(object):
                 c_in = dict()
                 for k in c:
                     if isinstance(c[k], list):
-                        c_in[k] = [torch.cat([
-                            unconditional_conditioning[k][i],
-                            c[k][i]]) for i in range(len(c[k]))]
+                        if c[k][0] is None:
+                            c_in[k] = None
+                        else:
+                            c_in[k] = [torch.cat([
+                                unconditional_conditioning[k][i],
+                                c[k][i]]) for i in range(len(c[k]))]
                     else:
                         c_in[k] = torch.cat([
                                 unconditional_conditioning[k],

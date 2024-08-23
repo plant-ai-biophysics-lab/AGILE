@@ -275,5 +275,28 @@ def normalization(channels):
 
 class PermuteTransform:
     def __call__(self, x):
-        # Permute dimensions from [3, 416, 416] to [416, 3, 416]
-        return x.permute(2, 1, 0)
+        # Permute dimensions from [512, 512, 3] to [512, 3, 512]
+        return np.transpose(x, (0, 1, 2))
+    
+# def transfer_latents(source_latents, target_latents, timestep, max_timestep=1000):
+#     # Ensure inputs are tensors
+#     assert isinstance(source_latents, torch.Tensor) and isinstance(target_latents, torch.Tensor), \
+#         "Inputs must be PyTorch tensors"
+    
+#     # Ensure shapes match
+#     assert source_latents.shape == target_latents.shape, \
+#         "Source and target latents must have the same shape"
+    
+#     # Calculate the transfer percentage using a non-linear function
+#     transfer_percentage = (timestep / max_timestep) ** 2  # Quadratic function
+    
+#     # Create a mask for latent transfer
+#     mask = torch.rand_like(target_latents) < transfer_percentage
+    
+#     # Create the result tensor
+#     result_latents = torch.where(mask, source_latents, target_latents)
+    
+#     # Create the noise tensor
+#     noise = torch.where(mask, source_latents, torch.zeros_like(source_latents))
+    
+#     return noise, result_latents

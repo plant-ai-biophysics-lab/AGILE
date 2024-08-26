@@ -1089,12 +1089,12 @@ class LatentDiffusion(DDPM):
         return mean_flat(kl_prior) / np.log(2.0)
 
     def p_losses(self, x_start, y_start, cond, t, noise=None):
-        # noise = default(noise, lambda: torch.randn_like(x_start))
-        # x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         
         # apply noise from synthetic image
-        noise = y_start
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
+        # noise = y_start
+        # x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
         model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}

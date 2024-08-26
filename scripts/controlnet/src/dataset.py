@@ -60,8 +60,9 @@ class ControlNetDataset(Dataset):
         yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
         if os.path.exists(yolo_file):
             mask = self.sam_model(np.array(source_image), yolo_file)
-            mask = np.expand_dims(mask, axis=2)
-            mask = np.repeat(mask, 3, axis=2)
+            
+            # convert from (3, 416, 416) to (416, 416, 3)
+            mask = np.moveaxis(mask, 0, -1)
         else:
             mask = np.zeros(source_image.shape[:2] + (3,), dtype=np.uint8)
         
@@ -73,6 +74,7 @@ class ControlNetDataset(Dataset):
             
         # Normalize images
         # mask = np.array(mask).astype(np.float32) / 255.0
+        mask = np.array(mask).astype(np.float32) / 127.5 - 1.0
         source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
         target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
 

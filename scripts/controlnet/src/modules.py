@@ -3,11 +3,12 @@ import os
 import numpy as np
 import torch.nn.functional as F
 
+from PIL import Image
 from tqdm import tqdm
 from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
-from transformers import CLIPTokenizer, CLIPTextModel, SamProcessor, SamModel
+from transformers import CLIPTokenizer, CLIPTextModel, SamProcessor, SamModel, pipeline
 
 from src.util import default, exists, extract_into_tensor, noise_like, zero_module, checkpoint
 
@@ -26,6 +27,7 @@ class SAM(nn.Module):
         super().__init__()
         
         # Load SAM model and processor
+        self.type = type
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.processor = SamProcessor.from_pretrained(type)
         self.model = SamModel.from_pretrained(type).to("cpu")  # Initially keep the model on CPU
@@ -42,24 +44,66 @@ class SAM(nn.Module):
         return bboxes
     
     @staticmethod
-    def create_binary_mask(mask, bboxes):
-        binary_mask = np.zeros(mask.shape, dtype=np.uint8)
+    def create_semantic_mask(mask, bboxes):
+
+        semantic_mask = np.zeros(mask.shape, dtype=np.uint8)
+
+        # Apply the segmentation mask to the areas within the bounding boxes
         for bbox in bboxes:
             x_center, y_center, width, height = bbox
             left = int((x_center - width / 2) * mask.shape[1])
             right = int((x_center + width / 2) * mask.shape[1])
             top = int((y_center - height / 2) * mask.shape[0])
             bottom = int((y_center + height / 2) * mask.shape[0])
-            
-            # Mask within the bounding box
-            binary_mask[top:bottom, left:right] = mask[top:bottom, left:right] == 1
 
-        return binary_mask
+            # Assign 1 to the object class within the bounding box
+            semantic_mask[top:bottom, left:right] = np.where(mask[top:bottom, left:right] == 1, 1, semantic_mask[top:bottom, left:right])
+
+        return semantic_mask
+    
+    @staticmethod
+    def combine_masks(masks):
+    
+        all_masks = np.zeros_like(masks[0])
+        output_masks = np.zeros((3, 416, 416), dtype=np.uint8)
+        
+        # Combine all masks 
+        for i, mask in enumerate(masks):
+            mask[mask == True] = i + 1
+            all_masks = np.where(mask, i + 1, all_masks)
+            
+        # Assign colors
+        colors = {
+            1: [255, 0, 0], # red
+            2: [0, 255, 0], # green
+            3: [0, 0, 255], # blue
+            4: [255, 255, 0], # yellow
+        }
+        for value, color in colors.items():
+            locs = all_masks == value
+            for channel, intensity in enumerate(color):
+                output_masks[channel][locs] = intensity
+                
+        return output_masks
+    
+    @staticmethod
+    def get_largest_masks(masks, num_masks=3):
+        # Calculate the area of each mask
+        mask_areas = [(i, np.sum(mask > 0)) for i, mask in enumerate(masks)]
+        
+        # Sort masks by area in descending order
+        mask_areas.sort(key=lambda x: x[1], reverse=True)
+        
+        # Get the indices of the three largest masks
+        largest_mask_indices = [idx for idx, area in mask_areas[:num_masks]]
+        
+        # Keep only the largest masks
+        largest_masks = [masks[idx] for idx in largest_mask_indices]
+        
+        return largest_masks, largest_mask_indices
     
     def forward(self, image, yolo_file):
         bboxes = self.load_yolo_annotations(yolo_file)
-        
-        # Prepare the image and bounding boxes for SAM
         input_points = []
         input_labels = []
         for bbox in bboxes:
@@ -69,34 +113,47 @@ class SAM(nn.Module):
             input_points.append([x, y])
             input_labels.append(1)  # Positive label for foreground
 
-        inputs = self.processor(image, input_points=[input_points], input_labels=[input_labels], return_tensors="pt").to(self.device)
-
-        # Move the model to the device for the forward pass
+        # Process inputs
+        inputs = self.processor(image, input_points=[input_points], input_labels=[input_labels], return_tensors="pt")
+        
+        # Move only the necessary inputs to GPU
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         self.model.to(self.device)
         
-        # Perform segmentation
         with torch.no_grad():
             outputs = self.model(**inputs)
-
-        # Move the model back to CPU
+        
+        # Move model and inputs back to CPU
         self.model.to("cpu")
+        inputs = {k: v.cpu() for k, v in inputs.items()}
+        torch.cuda.empty_cache()
 
-        # Get the segmentation masks
+        # Process outputs on CPU
+        outputs = {k: v.cpu() for k, v in outputs.items()}
         masks = self.processor.image_processor.post_process_masks(
-            outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
-        )[0]  # Get the first batch
+            outputs["pred_masks"], inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
+        )[0]
 
-        # Ensure the mask is 2D
-        masks = masks.squeeze().numpy()  # Squeeze to remove extra dimensions
-        if masks.ndim == 3 and masks.shape[0] == 1:  # Handle case where mask has extra channel dimension
+        masks = masks.squeeze().numpy()
+        if masks.ndim == 3 and masks.shape[0] == 1:
             masks = masks[0]
-        elif masks.ndim == 3 and masks.shape[0] == 3:  # If mask has three channels, convert to grayscale
+        elif masks.ndim == 3 and masks.shape[0] == 3:
             masks = np.mean(masks, axis=0)
-
-        # Create the binary mask
-        binary_mask = self.create_binary_mask(masks, bboxes)
-
-        return binary_mask
+            
+        semantic_mask = self.create_semantic_mask(masks, bboxes)
+        
+        generator = pipeline("mask-generation", model=self.type, device=self.device)
+        image = Image.fromarray(image)
+        outputs_bg = generator(image, points_per_batch=64)
+        background_masks = outputs_bg["masks"]
+        del generator
+        torch.cuda.empty_cache()
+        
+        largest_masks, _ = self.get_largest_masks(background_masks, num_masks=3)
+        largest_masks.append(semantic_mask)
+        combined_masks = self.combine_masks(largest_masks)
+        
+        return combined_masks
         
 class AbstractEncoder(nn.Module):
     def __init__(self):

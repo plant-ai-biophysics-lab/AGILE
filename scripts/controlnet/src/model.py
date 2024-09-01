@@ -4,6 +4,7 @@ import torch.nn as nn
 import numpy as np
 import tqdm
 import itertools
+import wandb
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
@@ -14,17 +15,99 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from omegaconf import ListConfig
+from transformers import pipeline
+from PIL import Image
 
 from src.modules import LitEma, make_beta_schedule, Encoder, Decoder, DiagonalGaussianDistribution, normal_kl, \
                         DDIMSampler, IdentityFirstStage, SpatialTransformer
 from src.util import default, instantiate_from_config, count_params, exists, disabled_train, \
                         extract_into_tensor, mean_flat, noise_like, log_txt_as_img, isimage, ismap, \
-                            timestep_embedding, linear, conv_nd, zero_module
+                            timestep_embedding, linear, conv_nd, zero_module, get_attn_maps
 from src.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
                          'adm': 'y'}
+
+class ImageTokenizer(pl.LightningModule):
+    
+    def __init__(
+        self,
+        trainable,
+        pretrained
+    ):
+        super().__init__()
+        self.trainable = trainable
+        self.pretrained = pretrained
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Define the feature extractor using a Hugging Face pipeline
+        self.feature_extractor_pipeline = pipeline(
+            task="image-feature-extraction", model=self.pretrained, device=device, do_resize=True
+        )
+        
+        # Directly access the model inside the pipeline and register it as a submodule
+        self.feature_extractor = self.feature_extractor_pipeline.model
+        
+        # Set the model's parameters to be trainable or not
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = self.trainable
+        
+        # Move to the correct device and set float type explicitly
+        self.feature_extractor.to(device)
+        self.feature_extractor = self.feature_extractor.float()
+        
+        # Count the number of trainable parameters
+        self.num_trainable_params = self.count_trainable_parameters(self.feature_extractor)
+        print(f"Number of trainable parameters for Tokenizer: {self.num_trainable_params}")
+        
+        # Apply updated model parameters to the pipeline
+        self.feature_extractor_pipeline.model = self.feature_extractor
+    
+    @staticmethod
+    def count_trainable_parameters(model):
+        model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+        params = sum([p.numel() for p in model_parameters])
+        return params
+        
+    # Forward pass directly through the feature extractor
+    def forward(self, x):
+        # Check if input is a PIL Image
+        if isinstance(x, Image.Image):
+            return self.feature_extractor_pipeline(x)
+        
+        # If input is a tensor, convert it to a PIL Image
+        if isinstance(x, torch.Tensor):
+            # Assuming x is of shape (batch size, 3, 512, 512)
+            batch_size = x.size(0)
+            pil_images = []
+
+            for i in range(batch_size):
+                # Convert each tensor image to a PIL image
+                img = x[i]  # Shape: (3, 512, 512)
+                
+                # Move the channels to the last dimension and convert to a numpy array
+                img = img.permute(1, 2, 0).cpu().numpy()
+                
+                # Convert to uint8
+                img = img.astype(np.uint8)
+                
+                # Convert to PIL Image
+                pil_image = Image.fromarray(img)
+                pil_images.append(pil_image)
+            
+            # If there's only one image, return it directly, otherwise pass the list to the pipeline
+            if batch_size == 1:
+                return self.feature_extractor_pipeline(pil_images[0], return_tensors=True)
+            else:
+                return self.feature_extractor_pipeline(pil_images, return_tensors=True)
+        else:
+            raise TypeError("Input to forward must be a PIL Image or a PyTorch tensor.")
+    
+    def configure_optimizers(self):
+        # Define an optimizer that includes parameters from the feature extractor
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        return optimizer
 
 class AutoencoderKL(pl.LightningModule):
     def __init__(self,
@@ -632,6 +715,10 @@ class DDPM(pl.LightningModule):
 
         self.log("global_step", self.global_step,
                  prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        
+        # Log each item in the loss_dict on step
+        wandb.log({f"{k}": v for k, v in loss_dict.items()}, step=self.global_step)
+        wandb.log({"global_step": self.global_step}, step=self.global_step)
 
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
@@ -816,10 +903,14 @@ class LatentDiffusion(DDPM):
                 # self.be_unconditional = True
             else:
                 model = instantiate_from_config(config)
-                self.cond_stage_model = model.eval()
-                self.cond_stage_model.train = disabled_train
-                for param in self.cond_stage_model.parameters():
-                    param.requires_grad = False
+                if getattr(model, 'trainable', False):
+                    print(f"Training {self.__class__.__name__} with trainable cond stage.")
+                    self.cond_stage_model = model.train()
+                else:
+                    self.cond_stage_model = model.eval()
+                    self.cond_stage_model.train = disabled_train
+                    for param in self.cond_stage_model.parameters():
+                        param.requires_grad = False
         else:
             assert config != '__is_first_stage__'
             assert config != '__is_unconditional__'
@@ -854,6 +945,11 @@ class LatentDiffusion(DDPM):
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
             else:
+                # check if c is a list and all items are to device
+                if isinstance(c, list):
+                    c = [ci.to(self.device) for ci in c]
+                else:
+                    c = c.to(self.device)
                 c = self.cond_stage_model(c)
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
@@ -959,7 +1055,7 @@ class LatentDiffusion(DDPM):
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach() # shape: (bs, c, h, w)
         
-        # encode hint also for forward noising process
+        # encode hint also in case needed
         if 'hint' in batch.keys():
             xy = super().get_input(batch, 'hint')
             xy = xy.to(self.device)
@@ -984,7 +1080,8 @@ class LatentDiffusion(DDPM):
                 if isinstance(xc, dict) or isinstance(xc, list):
                     c = self.get_learned_conditioning(xc)
                 else:
-                    c = self.get_learned_conditioning(xc.to(self.device))
+                    # c = self.get_learned_conditioning(xc.to(self.device))
+                    c = self.get_learned_conditioning(xc).to(self.device)
             else:
                 c = xc
             if bs is not None:
@@ -1091,6 +1188,7 @@ class LatentDiffusion(DDPM):
     def p_losses(self, x_start, y_start, cond, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        # x_noisy = self.q_sample(x_start=y_start, t=t, noise=noise)
         
         # apply noise from synthetic image
         # noise = y_start
@@ -1102,10 +1200,12 @@ class LatentDiffusion(DDPM):
 
         if self.parameterization == "x0":
             target = x_start
+            # target = y_start
         elif self.parameterization == "eps":
             target = noise
         elif self.parameterization == "v":
             target = self.get_v(x_start, noise, t)
+            # target = self.get_v(y_start, noise, t)
         else:
             raise NotImplementedError()
 
@@ -1529,8 +1629,8 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c, y = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: target c: mask
-        control = batch[self.control_key] # control: hint (condition)
+        x, c, y = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: synthetic c: prompt y: real
+        control = batch[self.control_key]
         if bs is not None:
             control = control[:bs]
         control = control.to(self.device)
@@ -1540,6 +1640,9 @@ class ControlLDM(LatentDiffusion):
         return x, y, dict(c_crossattn=[c], c_concat=[control]) # c_crossattn: condition / c_concat: hint (synthetic)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        
+        # check if save attention is in kwargs
+        save_attention = kwargs.get('save_attention', False)
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
@@ -1550,79 +1653,85 @@ class ControlLDM(LatentDiffusion):
         else:
             control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
             control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
-
-        return eps
+            if save_attention:
+                eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                return eps, attn_maps_layer
+            else:
+                eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                return eps
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
-        # return self.get_learned_conditioning([""] * N)
-        return self.get_learned_conditioning(torch.zeros([N, 3, 512, 512]).to(self.device))
+        return self.get_learned_conditioning([""] * N)
+        # return self.get_learned_conditioning(torch.zeros([N, 3, 512, 512]).to(self.device)).to(self.device)
 
     @torch.no_grad()
-    def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
+    def log_images(self, batch, N=1, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
-                   plot_diffusion_rows=False, unconditional_guidance_scale=9.0, unconditional_guidance_label=None,
+                   plot_diffusion_rows=False, unconditional_guidance_scale=20.0, unconditional_guidance_label=None,
                    use_ema_scope=True,
                    **kwargs):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, y, c = self.get_input(batch, self.first_stage_key, bs=N)
+        z, _, c = self.get_input(batch, self.first_stage_key, bs=N)
         if c["c_concat"] is not None:
             c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
             # log["control"] = c_cat * 2.0 - 1.0
             log["control"] = c_cat
         else:
             c_cat, c = None, c["c_crossattn"][0][:N]
-        N = min(z.shape[0], N)
-        n_row = min(z.shape[0], n_row)
+        # N = min(z.shape[0], N)
+        # n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
         # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
-        log["conditioning"] = self.decode_cond_stage(c)
+        # log["conditioning"] = self.decode_cond_stage(c)
 
-        if plot_diffusion_rows:
-            # get diffusion row
-            diffusion_row = list()
-            z_start = z[:n_row]
-            for t in range(self.num_timesteps):
-                if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
-                    t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
-                    t = t.to(self.device).long()
-                    noise = torch.randn_like(z_start)
-                    z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
-                    diffusion_row.append(self.decode_first_stage(z_noisy))
+        # if plot_diffusion_rows:
+        #     # get diffusion row
+        #     diffusion_row = list()
+        #     z_start = z[:n_row]
+        #     for t in range(self.num_timesteps):
+        #         if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+        #             t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
+        #             t = t.to(self.device).long()
+        #             noise = torch.randn_like(z_start)
+        #             z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
+        #             diffusion_row.append(self.decode_first_stage(z_noisy))
 
-            diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
-            diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
-            diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
-            diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
-            log["diffusion_row"] = diffusion_grid
+        #     diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
+        #     diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
+        #     diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
+        #     diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
+        #     log["diffusion_row"] = diffusion_grid
 
-        if sample:
-            # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                                     batch_size=N, ddim=use_ddim,
-                                                     ddim_steps=ddim_steps, eta=ddim_eta)
-            x_samples = self.decode_first_stage(samples)
-            log["samples"] = x_samples
-            if plot_denoise_rows:
-                denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
-                log["denoise_row"] = denoise_grid
+        # if sample:
+        #     # get denoise row
+        #     samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+        #                                              batch_size=N, ddim=use_ddim,
+        #                                              ddim_steps=ddim_steps, eta=ddim_eta)
+        #     x_samples = self.decode_first_stage(samples)
+        #     log["samples"] = x_samples
+        #     if plot_denoise_rows:
+        #         denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
+        #         log["denoise_row"] = denoise_grid
 
         if unconditional_guidance_scale > 0.0:
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            samples_cfg, intermediates = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
                                              unconditional_conditioning=uc_full,
-                                             input_y = y
+                                            #  input_y = y
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
+            x_samples_attn_maps = get_attn_maps(intermediates['attn_maps'])
+            # TODO: Decode attenion maps here
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
+            log["attn_maps"] = x_samples_attn_maps
 
         return log
 
@@ -1661,6 +1770,8 @@ class ControlLDM(LatentDiffusion):
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
         hs = []
+        layers_to_save = [7, 8, 9, 10]
+        attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
             emb = self.time_embed(t_emb)
@@ -1677,21 +1788,26 @@ class ControlledUnetModel(UNetModel):
             if only_mid_control or control is None:
                 h = torch.cat([h, hs.pop()], dim=1)
             else:
-                # print(h.shape, (hs[-1] + control[-1]).shape)
-                # h = torch.cat([h, hs.pop() + control.pop()], dim=1)
                 h1 = hs.pop() + control.pop()
                 h2 = h
 
-                # Pad h1 to match the size of h2
-                # if h1.shape[2:] != h2.shape[2:]:
-                #     pad = (0, h2.shape[3] - h1.shape[3], 0, h2.shape[2] - h1.shape[2])  # Padding on last two dimensions
-                #     h1 = F.pad(h1, pad)
-
                 h = torch.cat([h, h1], dim=1)
-            h = module(h, emb, context)
+            
+            # check if i is in the list of indices where we want to view the attention
+            if i in layers_to_save and 'save_attention' in kwargs and kwargs['save_attention']:
+                layer = i
+                h, attn_maps = module(h, emb, context, layer=layer)
+                attn_maps_layer[layer] = attn_maps
+            else:
+                h = module(h, emb, context)
 
         h = h.type(x.dtype)
-        return self.out(h)
+        
+        # return attention maps if not empty
+        if len(attn_maps_layer) > 0:
+            return self.out(h), attn_maps_layer
+        else: 
+            return self.out(h)
 
 class ControlNet(nn.Module):
     def __init__(
@@ -1940,7 +2056,7 @@ class ControlNet(nn.Module):
         h = x.type(self.dtype)
         for module, zero_conv in zip(self.input_blocks, self.zero_convs):
             if guided_hint is not None: # for adding hint and condition
-                h = module(h, emb, context=None)
+                h = module(h, emb, context=None) # make h (synthetic) same shape as hint (real)
                 
                 h += guided_hint
                 guided_hint = None

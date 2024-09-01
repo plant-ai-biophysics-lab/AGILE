@@ -5,14 +5,14 @@ import numpy as np
 
 from torch.utils.data import Dataset
 from PIL import Image
-from src.modules import SAM
+from src.modules import MaskImage
 
 class ControlNetDataset(Dataset):
     def __init__(self, source_images_path, target_images_path, transform=None):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
         self.transform = transform
-        self.sam_model = SAM()
+        self.mask_image = MaskImage()
         
         # Load image file paths
         self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
@@ -27,7 +27,7 @@ class ControlNetDataset(Dataset):
             self.data.append({
                 'source': source_file,
                 'target': target_file,
-                'prompt': '', # empty prompt
+                'prompt': 'grape',
                 'control': None # placeholder for control
             })
     
@@ -59,24 +59,19 @@ class ControlNetDataset(Dataset):
         # Get segmentation mask
         yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
         if os.path.exists(yolo_file):
-            mask = self.sam_model(np.array(source_image), yolo_file)
-            
-            # convert from (3, 416, 416) to (416, 416, 3)
-            mask = np.moveaxis(mask, 0, -1)
-        else:
-            mask = np.zeros(source_image.shape[:2] + (3,), dtype=np.uint8)
+            mask = self.mask_image(np.array(source_image), yolo_file)
         
         # Apply transformations if any
         if self.transform:
             source_image = self.transform(source_image)
             target_image = self.transform(target_image)
-            mask = self.transform(Image.fromarray(mask))
+            mask = self.transform(mask)
             
-        # Normalize images
-        # mask = np.array(mask).astype(np.float32) / 255.0
+        # # Normalize images
         mask = np.array(mask).astype(np.float32) / 127.5 - 1.0
         source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
         target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
 
         # return dict(jpg=target_image, txt=prompt, hint=source_image)
-        return dict(jpg=target_image, txt=prompt, control=mask, hint=source_image)
+        # return dict(jpg=source_image, txt=prompt, control=source_image, hint=mask)
+        return dict(jpg=source_image, txt=prompt, hint=source_image)

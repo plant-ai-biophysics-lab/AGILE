@@ -1,15 +1,15 @@
 import argparse
-import torch
 import pytorch_lightning as pl
 
 from pathlib import Path
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from torch import nn
 
 from src.util import create_model, load_state_dict, PermuteTransform, initialize_weights
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch import Trainer
 
 def main(args):
     
@@ -34,6 +34,9 @@ def main(args):
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
     
+    strength = 1.0
+    model.control_scales = ([strength] * 13)
+    
     # prepare dataset and dataloader
     transform = transforms.Compose([
         transforms.Resize((512, 512)),
@@ -53,12 +56,21 @@ def main(args):
     logger = ImageLogger(batch_frequency=args.logger_freq)
     logger.train_dataloader = dataloader
     
+    # prepare wandb logger
+    wandb_logger = WandbLogger(
+        entity='paibl',
+        project='controlnet',
+        name=f"{args.logs_dir.name}",
+        save_dir=args.logs_dir
+    )
+    
     # start training
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         default_root_dir=args.logs_dir,
         precision = 32,
         callbacks = [logger],
+        logger=wandb_logger,
         accumulate_grad_batches=args.batch_size*4,
     )
     trainer.fit(model, dataloader)
@@ -90,6 +102,8 @@ if __name__ == "__main__":
                     help="Directory to save logs.")
     ap.add_argument("--param", type=str, default="eps",
                     help="Parameterization for calculation loss: x0, eps, v.")
+    # TODO: Add args for strength and unconditional guidance scale
+    # TODO: Add args to generate final images
     args = ap.parse_args()
     
     main(args)

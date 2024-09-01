@@ -68,15 +68,24 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None):
+    def forward(self, x, emb, context=None, **kwargs):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
+                # check if 'layer' is in kwargs
+                if 'layer' in kwargs:
+                    x, attn_maps = layer(x, context, layer=kwargs['layer'])
+                else:
+                    x = layer(x, context)
             else:
                 x = layer(x)
-        return x
+        
+        # return attn maps if exists
+        if 'attn_maps' in locals():
+            return x, attn_maps
+        else:
+            return x
 
 
 class Upsample(nn.Module):

@@ -8,7 +8,8 @@ from tqdm import tqdm
 from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
-from transformers import CLIPTokenizer, CLIPTextModel, SamProcessor, SamModel, pipeline
+from transformers import CLIPTokenizer, CLIPTextModel
+    # SamProcessor, SamModel, pipeline
 
 from src.util import default, exists, extract_into_tensor, noise_like, zero_module, checkpoint
 
@@ -22,15 +23,15 @@ except:
     
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
-class SAM(nn.Module):
-    def __init__(self, type="facebook/sam-vit-huge"):
+class MaskImage(nn.Module):
+    def __init__(self, model_type="facebook/sam-vit-huge"):
         super().__init__()
         
-        # Load SAM model and processor
-        self.type = type
+        # # Load SAM model and processor
+        self.model_type = model_type
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.processor = SamProcessor.from_pretrained(type)
-        self.model = SamModel.from_pretrained(type).to("cpu")  # Initially keep the model on CPU
+        # self.processor = SamProcessor.from_pretrained(model_type)
+        # self.model = SamModel.from_pretrained(model_type).to("cpu")  # Initially keep the model on CPU
         
     @staticmethod
     def load_yolo_annotations(yolo_file):
@@ -42,118 +43,57 @@ class SAM(nn.Module):
             x_center, y_center, width, height = map(float, parts[1:])
             bboxes.append((x_center, y_center, width, height))
         return bboxes
-    
+
     @staticmethod
-    def create_semantic_mask(mask, bboxes):
+    def create_binary_mask(image_shape, bboxes):
+        # Create a blank binary mask
+        binary_mask = np.zeros(image_shape[:2], dtype=np.uint8)
 
-        semantic_mask = np.zeros(mask.shape, dtype=np.uint8)
-
-        # Apply the segmentation mask to the areas within the bounding boxes
+        # Set pixels inside bounding boxes to 1
         for bbox in bboxes:
             x_center, y_center, width, height = bbox
-            left = int((x_center - width / 2) * mask.shape[1])
-            right = int((x_center + width / 2) * mask.shape[1])
-            top = int((y_center - height / 2) * mask.shape[0])
-            bottom = int((y_center + height / 2) * mask.shape[0])
+            left = int((x_center - width / 2) * image_shape[1])
+            right = int((x_center + width / 2) * image_shape[1])
+            top = int((y_center - height / 2) * image_shape[0])
+            bottom = int((y_center + height / 2) * image_shape[0])
+            binary_mask[top:bottom, left:right] = 1
 
-            # Assign 1 to the object class within the bounding box
-            semantic_mask[top:bottom, left:right] = np.where(mask[top:bottom, left:right] == 1, 1, semantic_mask[top:bottom, left:right])
-
-        return semantic_mask
+        return binary_mask
     
     @staticmethod
-    def combine_masks(masks):
-    
-        all_masks = np.zeros_like(masks[0])
-        output_masks = np.zeros((3, 416, 416), dtype=np.uint8)
-        
-        # Combine all masks 
-        for i, mask in enumerate(masks):
-            mask[mask == True] = i + 1
-            all_masks = np.where(mask, i + 1, all_masks)
-            
-        # Assign colors
-        colors = {
-            1: [255, 0, 0], # red
-            2: [0, 255, 0], # green
-            3: [0, 0, 255], # blue
-            4: [255, 255, 0], # yellow
-        }
-        for value, color in colors.items():
-            locs = all_masks == value
-            for channel, intensity in enumerate(color):
-                output_masks[channel][locs] = intensity
-                
-        return output_masks
-    
-    @staticmethod
-    def get_largest_masks(masks, num_masks=3):
-        # Calculate the area of each mask
-        mask_areas = [(i, np.sum(mask > 0)) for i, mask in enumerate(masks)]
-        
-        # Sort masks by area in descending order
-        mask_areas.sort(key=lambda x: x[1], reverse=True)
-        
-        # Get the indices of the three largest masks
-        largest_mask_indices = [idx for idx, area in mask_areas[:num_masks]]
-        
-        # Keep only the largest masks
-        largest_masks = [masks[idx] for idx in largest_mask_indices]
-        
-        return largest_masks, largest_mask_indices
-    
+    def apply_mask_to_image(image, binary_mask):
+        # Ensure image and mask are the same size
+        if image.size != (binary_mask.shape[1], binary_mask.shape[0]):
+            raise ValueError("Image and mask must have the same dimensions.")
+
+        # Convert image to numpy array
+        image_array = np.array(image)
+
+        # Apply the mask: Set pixels inside the mask to black
+        masked_image = image_array.copy()
+        masked_image[binary_mask == 1] = 0  # Set foreground pixels (inside bounding boxes) to black
+
+        # Convert back to PIL image
+        masked_image = Image.fromarray(masked_image)
+        return masked_image
+
     def forward(self, image, yolo_file):
+        # Load bounding boxes from YOLO annotations
         bboxes = self.load_yolo_annotations(yolo_file)
-        input_points = []
-        input_labels = []
-        for bbox in bboxes:
-            x_center, y_center, width, height = bbox
-            x = x_center * image.shape[1]
-            y = y_center * image.shape[0]
-            input_points.append([x, y])
-            input_labels.append(1)  # Positive label for foreground
+        
+        # Create a binary mask where bounding boxes are marked
+        binary_mask = self.create_binary_mask(image.shape, bboxes)
+        
+        # Convert image to PIL for processing
+        image_pil = Image.fromarray(image)
+        
+        # Apply the binary mask to the image, preserving content outside the bounding boxes
+        masked_image = self.apply_mask_to_image(image_pil, binary_mask)
+        
+        # Save the masked image if required
+        # masked_image.save('test.png')
 
-        # Process inputs
-        inputs = self.processor(image, input_points=[input_points], input_labels=[input_labels], return_tensors="pt")
-        
-        # Move only the necessary inputs to GPU
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        self.model.to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        # Move model and inputs back to CPU
-        self.model.to("cpu")
-        inputs = {k: v.cpu() for k, v in inputs.items()}
-        torch.cuda.empty_cache()
-
-        # Process outputs on CPU
-        outputs = {k: v.cpu() for k, v in outputs.items()}
-        masks = self.processor.image_processor.post_process_masks(
-            outputs["pred_masks"], inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
-        )[0]
-
-        masks = masks.squeeze().numpy()
-        if masks.ndim == 3 and masks.shape[0] == 1:
-            masks = masks[0]
-        elif masks.ndim == 3 and masks.shape[0] == 3:
-            masks = np.mean(masks, axis=0)
-            
-        semantic_mask = self.create_semantic_mask(masks, bboxes)
-        
-        generator = pipeline("mask-generation", model=self.type, device=self.device)
-        image = Image.fromarray(image)
-        outputs_bg = generator(image, points_per_batch=64)
-        background_masks = outputs_bg["masks"]
-        del generator
-        torch.cuda.empty_cache()
-        
-        largest_masks, _ = self.get_largest_masks(background_masks, num_masks=3)
-        largest_masks.append(semantic_mask)
-        combined_masks = self.combine_masks(largest_masks)
-        
-        return combined_masks
+        return masked_image
         
 class AbstractEncoder(nn.Module):
     def __init__(self):
@@ -270,7 +210,7 @@ class DDIMSampler(object):
                corrector_kwargs=None,
                verbose=True,
                x_T=None,
-               log_every_t=100,
+               log_every_t=10,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
@@ -303,7 +243,7 @@ class DDIMSampler(object):
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
         # decoded synthetic image
-        x_T = kwargs['input_y'] if 'input_y' in kwargs else None
+        # x_T = kwargs['input_y'] if 'input_y' in kwargs else None
         
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
@@ -328,7 +268,7 @@ class DDIMSampler(object):
     def ddim_sampling(self, cond, shape,
                       x_T=None, ddim_use_original_steps=False,
                       callback=None, timesteps=None, quantize_denoised=False,
-                      mask=None, x0=None, img_callback=None, log_every_t=100,
+                      mask=None, x0=None, img_callback=None, log_every_t=10,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
                       ucg_schedule=None):
@@ -345,7 +285,7 @@ class DDIMSampler(object):
             subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
             timesteps = self.ddim_timesteps[:subset_end]
 
-        intermediates = {'x_inter': [img], 'pred_x0': [img]}
+        intermediates = {'x_inter': [img], 'pred_x0': [img], 'attn_maps': []}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         print(f"Running DDIM Sampling with {total_steps} timesteps")
@@ -372,13 +312,14 @@ class DDIMSampler(object):
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
                                       dynamic_threshold=dynamic_threshold)
-            img, pred_x0 = outs
+            img, pred_x0, attn_maps = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
-            if index % log_every_t == 0 or index == total_steps - 1:
+            if index % log_every_t == 0 or index == total_steps - 1: # TODO: log_every_t for attention maps
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
+                intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
 
         return img, intermediates
 
@@ -416,7 +357,10 @@ class DDIMSampler(object):
                     c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
-            model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+            # model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in, save_attention=True).chunk(2) 
+            # TODO: return attentionm maps also
+            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True)
+            model_uncond, model_t = model_uncond_t.chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 
         if self.model.parameterization == "v":
@@ -437,19 +381,7 @@ class DDIMSampler(object):
         a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
         sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
         sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-
-        # current prediction for x_0
-        # # Find the minimum shape to crop to if necessary
-        # if x.shape != e_t.shape or x.shape != a_t.shape or e_t.shape != a_t.shape:
-        #     min_shape = [min(d1, d2, d3) for d1, d2, d3 in zip(x.shape, e_t.shape, a_t.shape)]
-            
-        #     # Crop tensors to the minimum shape if necessary
-        #     if x.shape != min_shape:
-        #         x = x[:, :, :min_shape[2], :min_shape[3]]
-        #     if e_t.shape != min_shape:
-        #         e_t = e_t[:, :, :min_shape[2], :min_shape[3]]
-        #     if a_t.shape != min_shape:
-        #         a_t = a_t[:, :, :min_shape[2], :min_shape[3]]
+        
         if self.model.parameterization != "v":
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
         else:
@@ -467,7 +399,7 @@ class DDIMSampler(object):
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        return x_prev, pred_x0
+        return x_prev, pred_x0, attn_maps
 
     @torch.no_grad()
     def encode(self, x0, c, t_enc, use_original_steps=False, return_intermediates=None,
@@ -1106,7 +1038,7 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x, context=None, mask=None, return_attn_weights=False):
         h = self.heads
 
         q = self.to_q(x)
@@ -1137,7 +1069,10 @@ class CrossAttention(nn.Module):
 
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+        if return_attn_weights:
+            return self.to_out(out), sim[:, :, 0] # only return class token
+        else:
+            return self.to_out(out)
 
 class GEGLU(nn.Module):
     def __init__(self, dim_in, dim_out):
@@ -1188,14 +1123,24 @@ class BasicTransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
+        
+        # for saving attn maps
+        self.attn_maps = {}
 
     def forward(self, x, context=None):
         return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
     def _forward(self, x, context=None):
-        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
-        x = self.attn2(self.norm2(x), context=context) + x
+        attn1_output = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False)
+        # self.attn_maps['attn1'] = attn1_weights  # Store the attention weights
+        x = attn1_output + x  # Update x with the output of attn1
+
+        attn2_output, attn2_weights = self.attn2(self.norm2(x), context=context, return_attn_weights=True)
+        self.attn_maps['attn2'] = attn2_weights  # Store the attention weights
+        x = attn2_output + x  # Update x with the output of attn2
+
         x = self.ff(self.norm3(x)) + x
+
         return x
     
 class SpatialTransformer(nn.Module):
@@ -1241,7 +1186,15 @@ class SpatialTransformer(nn.Module):
             self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
         self.use_linear = use_linear
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, **kwargs):
+        
+        # check if attention layer to save
+        attn_maps = []
+        if 'layer' in kwargs:
+            layer = kwargs['layer']
+        else:
+            layer = None
+        
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, list):
             context = [context]
@@ -1258,27 +1211,21 @@ class SpatialTransformer(nn.Module):
         if self.use_linear:
             x = self.proj_in(x)
         
-        # processed_context = []
-        # for ctx in context:
-        #     if ctx is not None and len(ctx.shape) == 4:
-        #         ctx = self.norm(ctx)
-                
-        #         if not self.use_linear:
-        #             ctx = self.proj_in(ctx)
-                    
-        #         ctx = rearrange(ctx, 'b c h w -> b (h w) c').contiguous()
-                
-        #         if self.use_linear:
-        #             ctx = self.proj_in(ctx)
-                    
-        #         processed_context.append(ctx)
-        #     else:
-        #         processed_context.append(ctx)
-        
         for i, block in enumerate(self.transformer_blocks):
-            context_i = rearrange(context[i], 'b c h w -> b (h w) c').contiguous() if context[i] is not None else None
-            # x = block(x, context=context[i])
-            x = block(x, context=context_i)
+            # if context[i] has shape (b, c, h, w), we need to reshape to (b, h*w, c)
+            if len(context[i].shape) == 4:
+                context[i] = rearrange(context[i], 'b c h w -> b (h w) c').contiguous()
+
+            x = block(x, context=context[i])
+            if layer is not None:
+                if not hasattr(block, 'attn_maps'):
+                    continue
+                
+                # move attn maps (dict containing tensors on gpu) to cpu
+                attn_maps.append({k: v.detach().cpu() for k, v in block.attn_maps.items()})
+                
+        # clear stored attention maps to prevent overflow
+        block.attn_maps.clear()
         
         if self.use_linear:
             x = self.proj_out(x)
@@ -1287,6 +1234,9 @@ class SpatialTransformer(nn.Module):
         
         if not self.use_linear:
             x = self.proj_out(x)
+        
+        if layer is not None:
+            return x + x_in, attn_maps
         
         return x + x_in
 

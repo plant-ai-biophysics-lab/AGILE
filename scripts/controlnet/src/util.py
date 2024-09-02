@@ -309,7 +309,7 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
                     
                     # get the attention map
                     # a_map = values[num_heads:].mean(dim=0) # remove unconditional head and take the mean
-                    a_map = values[:num_heads].mean(dim=0)
+                    a_map = values.mean(dim=0) # take the mean
                     
                     # reshape into grid
                     map_size = int(math.sqrt(a_map.shape[-1]))
@@ -348,10 +348,12 @@ def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, sav
     """
     Visualizes aggregated attention maps in a grid layout and saves the visualization as an image.
 
-    :param agg_maps: Tensor of shape (num_layers+1, num_timesteps, H, W) containing attention maps.
+    :param agg_maps: Tensor of shape (num_layers, num_timesteps, H, W) containing attention maps.
+    :param rgb_image: RGB image tensor.
     :param column_titles: List of column titles (timesteps).
     :param row_titles: List of row titles (layer names).
     :param save_path: File path to save the visualization image.
+    :param alpha: Alpha value for overlay transparency.
     """
     num_layers, num_timesteps, H, W = agg_maps.shape
 
@@ -374,8 +376,8 @@ def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, sav
             # Resize attention map to match the size of the RGB image
             attention_resized = cv2.resize(attention_map, (rgb_image.shape[1], rgb_image.shape[0]))
 
-            # Apply colormap to the attention map
-            attention_colored = cv2.applyColorMap((attention_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            # Apply colormap to the attention map (change from JET to VIRIDIS)
+            attention_colored = cv2.applyColorMap((attention_resized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
             attention_colored = cv2.cvtColor(attention_colored, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
 
             # Overlay attention map on the RGB image
@@ -388,7 +390,6 @@ def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, sav
 
             # Set row titles (layer names)
             if j == 0:
-                # Turn on the axis for the row label
                 ax.axis('on')
                 ax.set_xticks([])  # Hide x-axis ticks
                 ax.set_yticks([])  # Hide y-axis ticks
@@ -397,15 +398,10 @@ def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, sav
             # Set column titles (timestep values)
             if i == 0:
                 ax.set_title(column_titles[j], size='small')
-
-    # # Adjust layout
-    # plt.subplots_adjust(left=0.15, top=0.85, hspace=0.3, wspace=0.3)
-    # fig.suptitle('Aggregated Attention Maps', fontsize=16)
-
+                
     # Add colorbar
     cbar = fig.colorbar(plt.cm.ScalarMappable(cmap='viridis'), ax=axes.ravel().tolist(), shrink=0.95, orientation='horizontal', pad=0.05)
     cbar.set_label('Attention Intensity')
 
     # Save the figure as an image
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Attention overlay saved to {save_path}")

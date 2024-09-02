@@ -298,7 +298,7 @@ class DDIMSampler(object):
 
             if mask is not None:
                 assert x0 is not None
-                img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
+                img_orig = self.model.q_sample(x0, ts)
                 img = img_orig * mask + (1. - mask) * img
 
             if ucg_schedule is not None:
@@ -316,7 +316,7 @@ class DDIMSampler(object):
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
-            if index % log_every_t == 0 or index == total_steps - 1: # TODO: log_every_t for attention maps
+            if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
                 intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
@@ -358,8 +358,7 @@ class DDIMSampler(object):
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
             # model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in, save_attention=True).chunk(2) 
-            # TODO: return attentionm maps also
-            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True)
+            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True) # TODO: optimize the embedding here if t = 10
             model_uncond, model_t = model_uncond_t.chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 

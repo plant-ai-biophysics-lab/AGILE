@@ -98,7 +98,7 @@ class ImageLogger(Callback):
         if not self.disabled:
             self.log_img(pl_module, batch, batch_idx, split="train")
 
-    # @rank_zero_only
+    # @rank_zero_only # TODO: Add command line args to enable/disable validation logging
     # def log_final_images(self, pl_module):
     #     if self.train_dataloader is None:
     #         return

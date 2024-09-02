@@ -993,7 +993,7 @@ class LatentDiffusion(DDPM):
             weighting = weighting * L_weighting
         return weighting
 
-    def get_fold_unfold(self, x, kernel_size, stride, uf=1, df=1):  # todo load once not every time, shorten code
+    def get_fold_unfold(self, x, kernel_size, stride, uf=1, df=1):
         """
         :param x: img of size (bs, c, h, w)
         :return: n img crops of size (n, bs, c, kernel_size[0], kernel_size[1])
@@ -1145,7 +1145,7 @@ class LatentDiffusion(DDPM):
             assert c is not None
             if self.cond_stage_trainable:
                 c = self.get_learned_conditioning(c)
-            if self.shorten_cond_schedule:  # TODO: drop this option
+            if self.shorten_cond_schedule:
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
         return self.p_losses(x, y, c, t, *args, **kwargs)
@@ -1193,7 +1193,7 @@ class LatentDiffusion(DDPM):
         # apply noise from synthetic image
         # noise = y_start
         # x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
-        model_output = self.apply_model(x_noisy, t, cond)
+        model_output = self.apply_model(x_noisy, t, cond, save_attention=True)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1729,7 +1729,6 @@ class ControlLDM(LatentDiffusion):
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             x_samples_attn_maps = get_attn_maps(intermediates['attn_maps'])
-            # TODO: Decode attenion maps here
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
             log["attn_maps"] = x_samples_attn_maps
 

@@ -1,15 +1,18 @@
 import argparse
+import os
+import torch
+import wandb
 import pytorch_lightning as pl
 
 from pathlib import Path
 from torchvision import transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from src.util import create_model, load_state_dict, PermuteTransform, initialize_weights
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
+from src.model import TextEmbeddingOptimizer
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch import Trainer
 
 def main(args):
     
@@ -45,6 +48,7 @@ def main(args):
     dataset = ControlNetDataset(
         source_images_path=args.source_images_path,
         target_images_path=args.target_images_path,
+        prompt=args.prompt,
         transform=transform
     )
     dataloader = DataLoader(
@@ -60,8 +64,8 @@ def main(args):
     wandb_logger = WandbLogger(
         entity='paibl',
         project='controlnet',
-        name=f"{args.logs_dir.name}",
-        save_dir=args.logs_dir
+        name=f"{args.logs_dir.name}_initial_training",
+        save_dir=args.logs_dir,
     )
     
     # start training
@@ -75,6 +79,47 @@ def main(args):
     )
     trainer.fit(model, dataloader)
     
+    # end wandb
+    wandb.finish()
+    
+    # optimize embeddings
+    if args.optimize_embeddings:
+                
+        # Set up the Wandb logger for embedding optimization
+        wandb.init(
+            entity='paibl',
+            project='controlnet',
+            name=f"{args.logs_dir.name}_embedding_optimization",
+            dir=args.logs_dir,
+            resume=False
+        )
+        
+        # Initialize Text Embedding Optimizer
+        text_optimizer = TextEmbeddingOptimizer(
+            prompt=args.prompt,
+            model=model,
+            batch_size=args.batch_size,
+            lr=0.1,
+            ddim_steps=50,
+            unconditional_guidance_scale=20.0,
+            logs_dir=os.path.join(args.logs_dir, "text_optimizer"),
+            optimization_steps=args.optimize_steps
+        )
+        
+        
+        # Use subset of dataloader
+        subset_indices = list(range(5))  # Indices of the first 5 images
+        subset_dataset = Subset(dataset, subset_indices)
+        dataloader = DataLoader(
+            subset_dataset,
+            num_workers=0,
+            batch_size=args.batch_size,
+            shuffle=True
+        )
+        
+        # Initialize Trainer for embedding optimization
+        text_optimizer.train(dataloader, num_epochs=args.optimize_epochs)
+        
 if __name__ == "__main__":
     
     ap = argparse.ArgumentParser()
@@ -102,6 +147,14 @@ if __name__ == "__main__":
                     help="Directory to save logs.")
     ap.add_argument("--param", type=str, default="eps",
                     help="Parameterization for calculation loss: x0, eps, v.")
+    ap.add_argument("--optimize_embeddings", action="store_true",
+                    help="If set, embeddings will be optimized.")
+    ap.add_argument("--prompt", type=str, default="grape",
+                    help="Prompt for text embeddings.")
+    ap.add_argument("--optimize_epochs", type=int, default=1,
+                    help="Number of epochs for optimizing embeddings.")
+    ap.add_argument("--optimize_steps", type=int, default=100,
+                    help="Number of optimization steps.")
     # TODO: Add args for strength and unconditional guidance scale
     # TODO: Add args to generate final images
     args = ap.parse_args()

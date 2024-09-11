@@ -69,15 +69,16 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
 
     def forward(self, x, emb, context=None, **kwargs):
+        optimizing = kwargs['optimizing'] if 'optimizing' in kwargs else False
         for layer in self:
             if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
+                x = layer(x, emb) # TODO: Use pytorch checkpoint                                    
             elif isinstance(layer, SpatialTransformer):
                 # check if 'layer' is in kwargs
                 if 'layer' in kwargs:
-                    x, attn_maps = layer(x, context, layer=kwargs['layer'])
+                    x, attn_maps = layer(x, context, layer=kwargs['layer'], optimizing=optimizing)
                 else:
-                    x = layer(x, context)
+                    x = layer(x, context, optimizing=optimizing)
             else:
                 x = layer(x)
         

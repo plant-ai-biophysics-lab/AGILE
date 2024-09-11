@@ -278,7 +278,11 @@ def normalization(channels):
 class PermuteTransform:
     def __call__(self, x):
         # Permute dimensions from [512, 512, 3] to [512, 3, 512]
-        return np.transpose(x, (0, 1, 2))
+        # Only permute if 3 channels are present
+        if len(np.array(x).shape) == 2:
+            return x
+        else:
+            return np.transpose(x, (0, 1, 2))
     
 def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
     
@@ -309,6 +313,7 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
                     
                     # get the attention map
                     # a_map = values[num_heads:].mean(dim=0) # remove unconditional head and take the mean
+                    values = values[:, :, 0] # keep only the class token
                     a_map = values.mean(dim=0) # take the mean
                     
                     # reshape into grid
@@ -344,7 +349,7 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
         'row_titles': row_titles
     }
     
-def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, save_path, alpha=0.7):
+def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, save_path, alpha=0.8):
     """
     Visualizes aggregated attention maps in a grid layout and saves the visualization as an image.
 

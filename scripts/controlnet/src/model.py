@@ -1,12 +1,17 @@
 import torch
 import einops
+import copy
 import torch.nn as nn
 import numpy as np
 import tqdm
 import itertools
 import wandb
+import math
+import os
+import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch.nn.functional as F
+import torch.optim as optim
 
 from functools import partial
 from contextlib import contextmanager, nullcontext
@@ -17,12 +22,13 @@ from torchvision.utils import make_grid
 from omegaconf import ListConfig
 from transformers import pipeline
 from PIL import Image
+from torchviz import make_dot
 
 from src.modules import LitEma, make_beta_schedule, Encoder, Decoder, DiagonalGaussianDistribution, normal_kl, \
-                        DDIMSampler, IdentityFirstStage, SpatialTransformer
+                        DDIMSampler, IdentityFirstStage, SpatialTransformer, DDIMSamplerWithGrad
 from src.util import default, instantiate_from_config, count_params, exists, disabled_train, \
                         extract_into_tensor, mean_flat, noise_like, log_txt_as_img, isimage, ismap, \
-                            timestep_embedding, linear, conv_nd, zero_module, get_attn_maps
+                            timestep_embedding, linear, conv_nd, zero_module, get_attn_maps, checkpoint
 from src.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -838,6 +844,9 @@ class LatentDiffusion(DDPM):
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None
+        
+        # FOR TEXT EMBEDDING OPTIMIZATION
+        self.optimize_embeddings = False
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -1064,7 +1073,7 @@ class LatentDiffusion(DDPM):
         else:
             y = None
 
-        if self.model.conditioning_key is not None and not self.force_null_conditioning:
+        if self.model.conditioning_key is not None and not self.force_null_conditioning: # TODO: I think I need to remove this (make text embedding as model parameter)
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
@@ -1110,6 +1119,16 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
+        if predict_cids:
+            if z.dim() == 4:
+                z = torch.argmax(z.exp(), dim=1).long()
+            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
+            z = rearrange(z, 'b h w c -> b c h w').contiguous()
+
+        z = 1. / self.scale_factor * z
+        return self.first_stage_model.decode(z)
+    
+    def decode_first_stage_grad(self, z, predict_cids=False, force_not_quantize=False):
         if predict_cids:
             if z.dim() == 4:
                 z = torch.argmax(z.exp(), dim=1).long()
@@ -1193,7 +1212,7 @@ class LatentDiffusion(DDPM):
         # apply noise from synthetic image
         # noise = y_start
         # x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
-        model_output = self.apply_model(x_noisy, t, cond, save_attention=True)
+        model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1643,22 +1662,43 @@ class ControlLDM(LatentDiffusion):
         
         # check if save attention is in kwargs
         save_attention = kwargs.get('save_attention', False)
+        
+        # check if optimizing is in kwargs
+        optimizing = kwargs.get('optimizing', False)
+        
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
-        cond_txt = torch.cat(cond['c_crossattn'], 1)
+        if optimizing:
+            with torch.enable_grad():
+                cond_txt = torch.cat(cond['c_crossattn'], 1)
+                cond_txt.retain_grad()
+        else:
+            cond_txt = torch.cat(cond['c_crossattn'], 1)
+        # require grad if cond['c_crossattn'] required grad
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
-            if save_attention:
-                eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
-                return eps, attn_maps_layer
+            if optimizing:
+                with torch.enable_grad():
+                    control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt, optimizing=optimizing)
+                    control = [c * scale for c, scale in zip(control, self.control_scales)]
+                    if save_attention:
+                        eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention, optimizing=optimizing)
+                        return eps, attn_maps_layer
+                    else:
+                        eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                        return eps
             else:
-                eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
-                return eps
+                control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+                control = [c * scale for c, scale in zip(control, self.control_scales)]
+                if save_attention:
+                    eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                    return eps, attn_maps_layer
+                else:
+                    eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                    return eps
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
@@ -1724,8 +1764,7 @@ class ControlLDM(LatentDiffusion):
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
-                                             unconditional_conditioning=uc_full,
-                                            #  input_y = y
+                                             unconditional_conditioning=uc_full
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             x_samples_attn_maps = get_attn_maps(intermediates['attn_maps'])
@@ -1737,6 +1776,16 @@ class ControlLDM(LatentDiffusion):
     @torch.no_grad()
     def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
         ddim_sampler = DDIMSampler(self)
+        if cond["c_concat"][0] is not None:
+            b, _, h, w = cond["c_concat"][0].shape
+        else:
+            b, _, h, w = cond["c_crossattn"][0].shape
+        shape = (self.channels, h // 8, w // 8)
+        samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, **kwargs)
+        return samples, intermediates
+    
+    def sample_log_with_grad(self, cond, batch_size, ddim, ddim_steps, **kwargs):
+        ddim_sampler = DDIMSamplerWithGrad(self)
         if cond["c_concat"][0] is not None:
             b, _, h, w = cond["c_concat"][0].shape
         else:
@@ -1768,6 +1817,10 @@ class ControlLDM(LatentDiffusion):
 
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
+        
+        # check if optimizing in kwargs
+        optimizing = kwargs.get('optimizing', False)
+        
         hs = []
         layers_to_save = [7, 8, 9, 10]
         attn_maps_layer = {}
@@ -1782,7 +1835,7 @@ class ControlledUnetModel(UNetModel):
 
         if control is not None:
             h += control.pop()
-
+        
         for i, module in enumerate(self.output_blocks):
             if only_mid_control or control is None:
                 h = torch.cat([h, hs.pop()], dim=1)
@@ -1795,7 +1848,7 @@ class ControlledUnetModel(UNetModel):
             # check if i is in the list of indices where we want to view the attention
             if i in layers_to_save and 'save_attention' in kwargs and kwargs['save_attention']:
                 layer = i
-                h, attn_maps = module(h, emb, context, layer=layer)
+                h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing)
                 attn_maps_layer[layer] = attn_maps
             else:
                 h = module(h, emb, context)
@@ -2043,8 +2096,12 @@ class ControlNet(nn.Module):
 
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
-
+    
     def forward(self, x, hint, timesteps, context, **kwargs):
+        
+        # check if `optimizing` is in kwargs
+        optimizing = kwargs.get('optimizing', False)
+        
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
@@ -2060,10 +2117,194 @@ class ControlNet(nn.Module):
                 h += guided_hint
                 guided_hint = None
             else:
-                h = module(h, emb, context)
+                h = module(h, emb, context, optimizing=optimizing)
             outs.append(zero_conv(h, emb, context))
 
-        h = self.middle_block(h, emb, context)
-        outs.append(self.middle_block_out(h, emb, context))
+        h = self.middle_block(h, emb, context, optimizing=optimizing)
+        outs.append(self.middle_block_out(h, emb, context, optimizing=optimizing))
 
         return outs
+    
+class TextEmbeddingOptimizer:
+    def __init__(
+        self,
+        prompt,
+        model,
+        batch_size,
+        lr,
+        ddim_steps,
+        unconditional_guidance_scale,
+        timestep_to_optimize='timestep_10',
+        logs_dir='optimize_logs',
+        optimization_steps=100,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.model = model.train()
+        self.batch_size = batch_size
+        self.lr = lr
+        self.ddim_steps = ddim_steps
+        self.unconditional_guidance_scale = unconditional_guidance_scale
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.logs_dir = logs_dir
+
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
+
+        self.model = self.model.to(self.device)
+
+        # Get text embedding and make it a leaf tensor
+        self.prompt = prompt
+
+        # For optimization parameters
+        self.timestep_to_optimize = timestep_to_optimize
+        self.att_type = 'attn2'
+        self.target_size = (512, 512)
+        self.opt_steps = optimization_steps
+
+        # Loss function
+        self.mse_loss = nn.MSELoss()
+        
+        # clear torch cache
+        torch.cuda.empty_cache()
+
+    def parse_attn_maps(self, attn_maps, timestep_to_optimize):
+        for _, attn_map_step in enumerate(attn_maps):
+            (timestep, attn_map_layers), = attn_map_step.items()
+            if timestep == timestep_to_optimize:
+                all_maps_in_layer = []
+                for _, (_, attn_map) in enumerate(attn_map_layers.items()):
+                    for attn_type, values in attn_map[0].items():
+                        if attn_type == self.att_type:
+                            # keep only class token
+                            values = values[:, :, 0]
+                            a_map = values.mean(dim=0)
+                            map_size = int(math.sqrt(a_map.shape[-1]))
+                            a_map = a_map.view(map_size, map_size)
+                            a_map = a_map.unsqueeze(0).unsqueeze(0)
+                            a_map = nn.functional.interpolate(
+                                a_map, size=self.target_size, mode='bilinear', align_corners=False)
+                            a_map = a_map.squeeze(0).squeeze(0)
+                            all_maps_in_layer.append(a_map)
+
+                all_maps_in_layer = torch.stack(all_maps_in_layer, dim=0)
+                all_maps_in_layer = all_maps_in_layer.mean(dim=0)
+
+                # Normalize between 0 and 1
+                all_maps_in_layer = (all_maps_in_layer - all_maps_in_layer.min()) / (
+                        all_maps_in_layer.max() - all_maps_in_layer.min())
+
+                break
+
+        return all_maps_in_layer
+
+    def train(self, dataloader, num_epochs):
+        latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
+        text_embedding = latent_from_prompt.clone().detach().to(self.device)
+        text_embedding.requires_grad = True
+        
+        # freeze model parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        optimizer = optim.AdamW([text_embedding], lr=self.lr)
+        
+        def check_model_changes():
+            for name, param in self.model.named_parameters():
+                if param.data.ne(param.orig_data).any():
+                    return True
+            return False
+        
+        # Store original data
+        for param in self.model.parameters():
+            param.orig_data = param.data.clone()
+        
+        current_step = 0
+        for epoch in range(num_epochs):
+            for batch_idx, batch in enumerate(dataloader):
+                N = self.batch_size
+                use_ddim = self.ddim_steps is not None
+
+                # Get input data
+                _, _, c = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                c_cat = c["c_concat"][0][:N]
+
+                uc_cross = self.model.get_unconditional_conditioning(N)
+                uc_cat = c_cat
+                uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
+
+                # Loop through optimization steps
+                for _ in range(self.opt_steps):
+                    optimizer.zero_grad()
+                    
+                    generated, intermediates = self.model.sample_log_with_grad(
+                        cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
+                        batch_size=N, ddim=use_ddim,
+                        ddim_steps=self.ddim_steps,
+                        unconditional_guidance_scale=self.unconditional_guidance_scale,
+                        unconditional_conditioning=uc_full
+                    )
+
+                    # Check if model parameters changed during forward pass
+                    if check_model_changes():
+                        print("Model parameters changed during forward pass!")
+
+                    # Post-process the generated result
+                    generated = self.model.decode_first_stage(generated)
+                    source_attn_map = intermediates['attn_maps']
+                    source_attn_map = self.parse_attn_maps(source_attn_map, self.timestep_to_optimize).to(self.device)
+                    target_attn_map = batch['attn_map'].squeeze(0).to(self.device)
+
+                    # Compute loss and backward pass
+                    loss = self.mse_loss(source_attn_map, target_attn_map)
+                    loss.backward()
+                    
+                    # Check if model parameters changed during backward pass
+                    if check_model_changes():
+                        print("Model parameters changed during backward pass!")
+                    
+                    optimizer.step()
+                    
+                    # Check if loss updated embedding
+                    if text_embedding.grad is None:
+                        print('Text Embedding did not update. Check Computation Graph!')
+                
+                    # Log images every 10 optimization steps
+                    if _ % 10 == 0:
+                        self.log_images(generated, target_attn_map, source_attn_map, batch_idx, _)
+
+                    print(f"Epoch: {epoch}, Batch: {batch_idx}, Opt_step: {_}, Loss: {loss.item()}")
+
+                    # Log optimization loss with wandb
+                    wandb.log({'optimization/loss': loss.item()}, step=current_step)
+                    current_step += 1
+        
+        # Clean up
+        for param in self.model.parameters():
+            if hasattr(param, 'orig_data'):
+                del param.orig_data
+        
+        # Retrieve and save the optimized embeddings
+        optimized_embeddings = text_embedding.detach().cpu()
+        torch.save(optimized_embeddings, os.path.join(self.logs_dir, "optimized_embeddings.pt"))
+
+    def log_images(self, generated, target_attn_map, source_attn_map, idx, opt_steps):
+        generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+        generated = (generated - generated.min()) / (generated.max() - generated.min())
+        generated = (generated * 255).astype(np.uint8)
+
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+        ax[0].imshow(generated)
+        ax[0].axis('off')
+        ax[0].set_title('Generated Image')
+
+        ax[1].imshow(target_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[1].axis('off')
+        ax[1].set_title('Target Attention Map')
+
+        ax[2].imshow(source_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[2].axis('off')
+        ax[2].set_title('Source Attention Map')
+
+        plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")

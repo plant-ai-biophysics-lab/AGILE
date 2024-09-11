@@ -8,9 +8,10 @@ from PIL import Image
 from src.modules import MaskImage
 
 class ControlNetDataset(Dataset):
-    def __init__(self, source_images_path, target_images_path, transform=None):
+    def __init__(self, source_images_path, target_images_path, prompt, transform=None):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
+        self.prompt = prompt
         self.transform = transform
         self.mask_image = MaskImage()
         
@@ -27,7 +28,7 @@ class ControlNetDataset(Dataset):
             self.data.append({
                 'source': source_file,
                 'target': target_file,
-                'prompt': 'grape',
+                'prompt': self.prompt,
                 'control': None # placeholder for control
             })
     
@@ -38,6 +39,37 @@ class ControlNetDataset(Dataset):
         elif len(self.target_image_files) < len(self.source_image_files):
             deficit = len(self.source_image_files) - len(self.target_image_files)
             self.target_image_files += random.choices(self.target_image_files, k=deficit)
+    
+    @staticmethod
+    def gaussian_map(image, yolo_file, sigma=25.0):
+        
+        # Create an empty attention map
+        attention_map = np.zeros(image.shape[:2])
+        
+        # Create a grid of coordinates
+        x_coords = np.arange(image.shape[1])
+        y_coords = np.arange(image.shape[0])
+        x_grid, y_grid = np.meshgrid(x_coords, y_coords)
+        
+        # Get center points
+        with open(yolo_file, 'r') as f:
+            label = f.readlines()
+        center_points = []
+        for line in label:
+            _, x_center, y_center, _, _ = map(float, line.split())
+            center_points.append((x_center * image.shape[1], y_center * image.shape[0]))
+            
+        # Generate attention map
+        for x, y in center_points:
+            dist_squared = (x_grid - x) ** 2 + (y_grid - y) ** 2
+            attention_map += np.exp(-dist_squared / (2 * sigma ** 2))
+            
+        attention_map /= np.max(attention_map)
+        
+        # Change to PIL image
+        attention_map = Image.fromarray((attention_map * 255).astype(np.uint8))
+            
+        return attention_map
     
     def __len__(self):
         return len(self.data)
@@ -56,22 +88,28 @@ class ControlNetDataset(Dataset):
         source_image = Image.open(source_image_path).convert("RGB")
         target_image = Image.open(target_image_path).convert("RGB")
             
-        # Get segmentation mask
+        # Get attention map
         yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
-        if os.path.exists(yolo_file):
-            mask = self.mask_image(np.array(source_image), yolo_file)
+        attn_map = self.gaussian_map(np.array(source_image), yolo_file)
         
         # Apply transformations if any
         if self.transform:
             source_image = self.transform(source_image)
             target_image = self.transform(target_image)
-            mask = self.transform(mask)
+            attn_map = self.transform(attn_map)
             
-        # # Normalize images
-        mask = np.array(mask).astype(np.float32) / 127.5 - 1.0
+        # Normalize images
         source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
         target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
+        
+        # Normalize attention map between 0 and 1
+        attn_map = np.array(attn_map).astype(np.float32) / 255.0
 
-        # return dict(jpg=target_image, txt=prompt, hint=source_image)
-        # return dict(jpg=source_image, txt=prompt, control=source_image, hint=mask)
-        return dict(jpg=source_image, txt=prompt, hint=source_image)
+        return dict(
+            jpg=source_image,
+            txt=prompt,
+            hint=source_image,
+            source_path=source_image_path,
+            target_path=target_image_path,
+            attn_map=attn_map,
+        )

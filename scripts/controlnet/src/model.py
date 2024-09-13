@@ -23,6 +23,7 @@ from omegaconf import ListConfig
 from transformers import pipeline
 from PIL import Image
 from torchviz import make_dot
+from torch.optim.lr_scheduler import StepLR
 
 from src.modules import LitEma, make_beta_schedule, Encoder, Decoder, DiagonalGaussianDistribution, normal_kl, \
                         DDIMSampler, IdentityFirstStage, SpatialTransformer, DDIMSamplerWithGrad
@@ -34,86 +35,6 @@ from src.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsa
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
                          'adm': 'y'}
-
-class ImageTokenizer(pl.LightningModule):
-    
-    def __init__(
-        self,
-        trainable,
-        pretrained
-    ):
-        super().__init__()
-        self.trainable = trainable
-        self.pretrained = pretrained
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Define the feature extractor using a Hugging Face pipeline
-        self.feature_extractor_pipeline = pipeline(
-            task="image-feature-extraction", model=self.pretrained, device=device, do_resize=True
-        )
-        
-        # Directly access the model inside the pipeline and register it as a submodule
-        self.feature_extractor = self.feature_extractor_pipeline.model
-        
-        # Set the model's parameters to be trainable or not
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = self.trainable
-        
-        # Move to the correct device and set float type explicitly
-        self.feature_extractor.to(device)
-        self.feature_extractor = self.feature_extractor.float()
-        
-        # Count the number of trainable parameters
-        self.num_trainable_params = self.count_trainable_parameters(self.feature_extractor)
-        print(f"Number of trainable parameters for Tokenizer: {self.num_trainable_params}")
-        
-        # Apply updated model parameters to the pipeline
-        self.feature_extractor_pipeline.model = self.feature_extractor
-    
-    @staticmethod
-    def count_trainable_parameters(model):
-        model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-        params = sum([p.numel() for p in model_parameters])
-        return params
-        
-    # Forward pass directly through the feature extractor
-    def forward(self, x):
-        # Check if input is a PIL Image
-        if isinstance(x, Image.Image):
-            return self.feature_extractor_pipeline(x)
-        
-        # If input is a tensor, convert it to a PIL Image
-        if isinstance(x, torch.Tensor):
-            # Assuming x is of shape (batch size, 3, 512, 512)
-            batch_size = x.size(0)
-            pil_images = []
-
-            for i in range(batch_size):
-                # Convert each tensor image to a PIL image
-                img = x[i]  # Shape: (3, 512, 512)
-                
-                # Move the channels to the last dimension and convert to a numpy array
-                img = img.permute(1, 2, 0).cpu().numpy()
-                
-                # Convert to uint8
-                img = img.astype(np.uint8)
-                
-                # Convert to PIL Image
-                pil_image = Image.fromarray(img)
-                pil_images.append(pil_image)
-            
-            # If there's only one image, return it directly, otherwise pass the list to the pipeline
-            if batch_size == 1:
-                return self.feature_extractor_pipeline(pil_images[0], return_tensors=True)
-            else:
-                return self.feature_extractor_pipeline(pil_images, return_tensors=True)
-        else:
-            raise TypeError("Input to forward must be a PIL Image or a PyTorch tensor.")
-    
-    def configure_optimizers(self):
-        # Define an optimizer that includes parameters from the feature extractor
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
-        return optimizer
 
 class AutoencoderKL(pl.LightningModule):
     def __init__(self,
@@ -1086,7 +1007,10 @@ class LatentDiffusion(DDPM):
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
-                if isinstance(xc, dict) or isinstance(xc, list):
+                # check if xc is already a tensor
+                if torch.is_tensor(xc):
+                    c = xc.squeeze(0)
+                elif isinstance(xc, dict) or isinstance(xc, list):
                     c = self.get_learned_conditioning(xc)
                 else:
                     # c = self.get_learned_conditioning(xc.to(self.device))
@@ -1212,7 +1136,7 @@ class LatentDiffusion(DDPM):
         # apply noise from synthetic image
         # noise = y_start
         # x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
-        model_output = self.apply_model(x_noisy, t, cond)
+        model_output = self.apply_model(x_noisy, t, cond) # TODO: Optimize text embedding
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1228,7 +1152,7 @@ class LatentDiffusion(DDPM):
         else:
             raise NotImplementedError()
 
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3]) 
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
@@ -1680,7 +1604,7 @@ class ControlLDM(LatentDiffusion):
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            if optimizing:
+            if optimizing: # TODO: Set this to true during DDPM process
                 with torch.enable_grad():
                     control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt, optimizing=optimizing)
                     control = [c * scale for c, scale in zip(control, self.control_scales)]
@@ -2206,18 +2130,12 @@ class TextEmbeddingOptimizer:
         # freeze model parameters
         for param in self.model.parameters():
             param.requires_grad = False
+        self.model.eval()
 
         optimizer = optim.AdamW([text_embedding], lr=self.lr)
+        scheduler = StepLR(optimizer, step_size=100, gamma=0.5)
         
-        def check_model_changes():
-            for name, param in self.model.named_parameters():
-                if param.data.ne(param.orig_data).any():
-                    return True
-            return False
-        
-        # Store original data
-        for param in self.model.parameters():
-            param.orig_data = param.data.clone()
+        initial_params = {name: param.clone() for name, param in self.model.named_parameters()}
         
         current_step = 0
         for epoch in range(num_epochs):
@@ -2245,10 +2163,6 @@ class TextEmbeddingOptimizer:
                         unconditional_conditioning=uc_full
                     )
 
-                    # Check if model parameters changed during forward pass
-                    if check_model_changes():
-                        print("Model parameters changed during forward pass!")
-
                     # Post-process the generated result
                     generated = self.model.decode_first_stage(generated)
                     source_attn_map = intermediates['attn_maps']
@@ -2258,13 +2172,13 @@ class TextEmbeddingOptimizer:
                     # Compute loss and backward pass
                     loss = self.mse_loss(source_attn_map, target_attn_map)
                     loss.backward()
-                    
-                    # Check if model parameters changed during backward pass
-                    if check_model_changes():
-                        print("Model parameters changed during backward pass!")
-                    
                     optimizer.step()
+                    scheduler.step()
                     
+                    for name, param in self.model.named_parameters():
+                        if not torch.equal(param, initial_params[name]):
+                            print(f"Parameter {name} has changed!")
+
                     # Check if loss updated embedding
                     if text_embedding.grad is None:
                         print('Text Embedding did not update. Check Computation Graph!')
@@ -2274,15 +2188,11 @@ class TextEmbeddingOptimizer:
                         self.log_images(generated, target_attn_map, source_attn_map, batch_idx, _)
 
                     print(f"Epoch: {epoch}, Batch: {batch_idx}, Opt_step: {_}, Loss: {loss.item()}")
+                    print(f"Learing Rate: {scheduler.get_last_lr()}")
 
                     # Log optimization loss with wandb
                     wandb.log({'optimization/loss': loss.item()}, step=current_step)
                     current_step += 1
-        
-        # Clean up
-        for param in self.model.parameters():
-            if hasattr(param, 'orig_data'):
-                del param.orig_data
         
         # Retrieve and save the optimized embeddings
         optimized_embeddings = text_embedding.detach().cpu()

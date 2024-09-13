@@ -341,7 +341,7 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
         agg_maps[j+1, i] = all_maps_in_layer.cpu().detach()
     
     # normalize all maps to [0, 1]
-    agg_maps = (agg_maps - agg_maps.min()) / (agg_maps.max() - agg_maps.min())
+    # agg_maps = (agg_maps - agg_maps.min()) / (agg_maps.max() - agg_maps.min())
     
     return {
         'agg_maps': agg_maps,

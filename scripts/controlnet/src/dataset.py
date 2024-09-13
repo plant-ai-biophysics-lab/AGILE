@@ -5,7 +5,6 @@ import numpy as np
 
 from torch.utils.data import Dataset
 from PIL import Image
-from src.modules import MaskImage
 
 class ControlNetDataset(Dataset):
     def __init__(self, source_images_path, target_images_path, prompt, transform=None):
@@ -13,7 +12,6 @@ class ControlNetDataset(Dataset):
         self.target_images_path = target_images_path
         self.prompt = prompt
         self.transform = transform
-        self.mask_image = MaskImage()
         
         # Load image file paths
         self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
@@ -41,7 +39,7 @@ class ControlNetDataset(Dataset):
             self.target_image_files += random.choices(self.target_image_files, k=deficit)
     
     @staticmethod
-    def gaussian_map(image, yolo_file, sigma=25.0):
+    def gaussian_map(image, yolo_file, sigma=50.0):
         
         # Create an empty attention map
         attention_map = np.zeros(image.shape[:2])

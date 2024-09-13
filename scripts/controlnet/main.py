@@ -40,6 +40,12 @@ def main(args):
     strength = 1.0
     model.control_scales = ([strength] * 13)
     
+    # get optimized prompt embedding if exists
+    if args.prompt_embedding is not None:
+        prompt = torch.load(args.prompt_embedding)
+    else:
+        prompt = args.prompt
+    
     # prepare dataset and dataloader
     transform = transforms.Compose([
         transforms.Resize((512, 512)),
@@ -48,7 +54,7 @@ def main(args):
     dataset = ControlNetDataset(
         source_images_path=args.source_images_path,
         target_images_path=args.target_images_path,
-        prompt=args.prompt,
+        prompt=prompt,
         transform=transform
     )
     dataloader = DataLoader(
@@ -57,7 +63,8 @@ def main(args):
         batch_size=args.batch_size,
         shuffle=True
     )
-    logger = ImageLogger(batch_frequency=args.logger_freq)
+    
+    logger = ImageLogger(epoch_frequency=args.logger_freq)
     logger.train_dataloader = dataloader
     
     # prepare wandb logger
@@ -96,19 +103,19 @@ def main(args):
         
         # Initialize Text Embedding Optimizer
         text_optimizer = TextEmbeddingOptimizer(
-            prompt=args.prompt,
+            prompt=prompt,
             model=model,
             batch_size=args.batch_size,
-            lr=0.1,
+            lr=0.01,
             ddim_steps=50,
             unconditional_guidance_scale=20.0,
             logs_dir=os.path.join(args.logs_dir, "text_optimizer"),
             optimization_steps=args.optimize_steps
         )
         
-        
         # Use subset of dataloader
-        subset_indices = list(range(5))  # Indices of the first 5 images
+        num_indices = min(1, len(dataset))
+        subset_indices = list(range(num_indices))
         subset_dataset = Subset(dataset, subset_indices)
         dataloader = DataLoader(
             subset_dataset,
@@ -139,7 +146,7 @@ if __name__ == "__main__":
                     help="Path to target images.")
     ap.add_argument("--batch_size", type=int, default=1,
                     help="Batch size for training.")
-    ap.add_argument("--logger_freq", type=int, default=300,
+    ap.add_argument("--logger_freq", type=int, default=1,
                     help="Logging frequency.")
     ap.add_argument("--epochs", type=int, default=100,
                     help="Number of epochs for training.")
@@ -155,6 +162,8 @@ if __name__ == "__main__":
                     help="Number of epochs for optimizing embeddings.")
     ap.add_argument("--optimize_steps", type=int, default=100,
                     help="Number of optimization steps.")
+    ap.add_argument("--prompt_embedding", type=Path, default=None,
+                    help="Path to optimized prompt embedding.")
     # TODO: Add args for strength and unconditional guidance scale
     # TODO: Add args to generate final images
     args = ap.parse_args()

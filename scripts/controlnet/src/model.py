@@ -646,6 +646,11 @@ class DDPM(pl.LightningModule):
         # Log each item in the loss_dict on step
         wandb.log({f"{k}": v for k, v in loss_dict.items()}, step=self.global_step)
         wandb.log({"global_step": self.global_step}, step=self.global_step)
+        
+        # if batch_idx == 0:  # Visualize the graph for the first batch only to avoid clutter
+        #     graph = make_dot(loss, params=dict(self.named_parameters()))
+        #     graph.render("computation_graph", format="png")
+        
 
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
@@ -768,6 +773,7 @@ class LatentDiffusion(DDPM):
         
         # FOR TEXT EMBEDDING OPTIMIZATION
         self.optimize_embeddings = False
+        self.attn_loss_weight = 1.0
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -1031,7 +1037,14 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
-        out = [z, c, y]
+                
+        # get attention map
+        if 'attn_map' in batch.keys():
+            attn_map = batch['attn_map']
+        else:
+            attn_map = None
+            
+        out = [z, c, y, attn_map]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -1078,8 +1091,8 @@ class LatentDiffusion(DDPM):
         return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, y, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, y, c)
+        x, y, c, attn_map = self.get_input(batch, self.first_stage_key)
+        loss = self(x, y, c, attn_map=attn_map)
         return loss
 
     def forward(self, x, y, c, *args, **kwargs):
@@ -1128,36 +1141,33 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, y_start, cond, t, noise=None):
+    def p_losses(self, x_start, y_start, cond, t, noise=None, **kwargs):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        # x_noisy = self.q_sample(x_start=y_start, t=t, noise=noise)
-        
-        # apply noise from synthetic image
-        # noise = y_start
-        # x_noisy = self.q_sample(x_start=x_start, t=t, noise=y_start)
-        model_output = self.apply_model(x_noisy, t, cond) # TODO: Optimize text embedding
+
+        if self.parameterization == "eps_attn":
+            model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True)
+        else:
+            model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
 
         if self.parameterization == "x0":
             target = x_start
-            # target = y_start
-        elif self.parameterization == "eps":
+        elif self.parameterization == "eps" or self.parameterization == "eps_attn":
             target = noise
         elif self.parameterization == "v":
             target = self.get_v(x_start, noise, t)
-            # target = self.get_v(y_start, noise, t)
         else:
             raise NotImplementedError()
 
+        # get diffusion loss
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3]) 
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
@@ -1169,8 +1179,52 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
+        
+        # get attention loss
+        if self.parameterization == "eps_attn":
+            source_attn = self.get_avg_attn(attn_maps)
+            target_attn = kwargs['attn_map'].squeeze(0)
+            
+            # mse loss
+            attn_loss = torch.nn.functional.mse_loss(source_attn, target_attn)
+            
+            # add to existing loss
+            loss = loss + self.attn_loss_weight*attn_loss
+            
+            # update loss dict
+            loss_dict.update({f'{prefix}/attn_loss': attn_loss})
 
         return loss, loss_dict
+    
+    @staticmethod
+    def get_avg_attn(attn_maps, type='attn2', target_size=(512, 512)):
+        avg_maps = []
+        
+        # remove if not needed
+        # attn_maps = {key: attn_maps[key] for key in [7,8]}
+        
+        for _, (_, attn_map) in enumerate(attn_maps.items()):
+            for attn_type, values in attn_map[0].items():
+                if attn_type == type:
+                    # keep only class token
+                    values = values[:, :, 0]
+                    a_map = values.mean(dim=0)
+                    map_size = int(math.sqrt(a_map.shape[-1]))
+                    a_map = a_map.view(map_size, map_size)
+                    a_map = a_map.unsqueeze(0).unsqueeze(0)
+                    a_map = nn.functional.interpolate(
+                        a_map, size=target_size, mode='bilinear', align_corners=False)
+                    a_map = a_map.squeeze(0).squeeze(0)
+                    avg_maps.append(a_map)
+
+        avg_maps = torch.stack(avg_maps, dim=0)
+        avg_maps = avg_maps.mean(dim=0)
+
+        # Normalize between 0 and 1
+        avg_maps = (avg_maps - avg_maps.min()) / (
+                avg_maps.max() - avg_maps.min())
+        
+        return avg_maps
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
@@ -1572,7 +1626,7 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c, y = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: synthetic c: prompt y: real
+        x, c, y, attn_map = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: synthetic c: prompt y: real
         control = batch[self.control_key]
         if bs is not None:
             control = control[:bs]
@@ -1580,7 +1634,7 @@ class ControlLDM(LatentDiffusion):
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
         # return x, dict(c_crossattn=[c], c_concat=None)
-        return x, y, dict(c_crossattn=[c], c_concat=[control]) # c_crossattn: condition / c_concat: hint (synthetic)
+        return x, y, dict(c_crossattn=[c], c_concat=[control]), attn_map # c_crossattn: condition / c_concat: hint (synthetic)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         
@@ -1596,7 +1650,7 @@ class ControlLDM(LatentDiffusion):
         if optimizing:
             with torch.enable_grad():
                 cond_txt = torch.cat(cond['c_crossattn'], 1)
-                cond_txt.retain_grad()
+                # cond_txt.retain_grad()
         else:
             cond_txt = torch.cat(cond['c_crossattn'], 1)
         # require grad if cond['c_crossattn'] required grad
@@ -1638,7 +1692,7 @@ class ControlLDM(LatentDiffusion):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, _, c = self.get_input(batch, self.first_stage_key, bs=N)
+        z, _, c, _ = self.get_input(batch, self.first_stage_key, bs=N)
         if c["c_concat"] is not None:
             c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
             # log["control"] = c_cat * 2.0 - 1.0
@@ -2123,8 +2177,13 @@ class TextEmbeddingOptimizer:
         return all_maps_in_layer
 
     def train(self, dataloader, num_epochs):
-        latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
-        text_embedding = latent_from_prompt.clone().detach().to(self.device)
+        # if prompt is tensor, skip encoding
+        if isinstance(self.prompt, torch.Tensor):
+            print("Using optimized embedding!")
+            text_embedding = self.prompt.clone().detach().to(self.device)
+        else:
+            latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
+            text_embedding = latent_from_prompt.clone().detach().to(self.device)
         text_embedding.requires_grad = True
         
         # freeze model parameters

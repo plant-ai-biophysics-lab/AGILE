@@ -39,7 +39,7 @@ class ControlNetDataset(Dataset):
             self.target_image_files += random.choices(self.target_image_files, k=deficit)
     
     @staticmethod
-    def gaussian_map(image, yolo_file, sigma=50.0):
+    def gaussian_map(image, yolo_file, sigma=30.0):
         
         # Create an empty attention map
         attention_map = np.zeros(image.shape[:2])
@@ -104,7 +104,7 @@ class ControlNetDataset(Dataset):
         attn_map = np.array(attn_map).astype(np.float32) / 255.0
 
         return dict(
-            jpg=source_image,
+            jpg=target_image,
             txt=prompt,
             hint=source_image,
             source_path=source_image_path,

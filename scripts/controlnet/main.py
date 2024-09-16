@@ -2,6 +2,7 @@ import argparse
 import os
 import torch
 import wandb
+import random
 import pytorch_lightning as pl
 
 from pathlib import Path
@@ -31,14 +32,18 @@ def main(args):
                     del state_dict[name]
         model.load_state_dict(state_dict, strict=False)
         print(f"Mismatches: {mismatch_count} out of {total_count}")
-                
+    
+    # edit model parameters
     model.learning_rate = args.learning_rate
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
+    model.attn_loss_weight = 2.0
     
     strength = 1.0
     model.control_scales = ([strength] * 13)
+    
+    print(f"Using parameterization: {model.parameterization}")
     
     # get optimized prompt embedding if exists
     if args.prompt_embedding is not None:
@@ -115,7 +120,8 @@ def main(args):
         
         # Use subset of dataloader
         num_indices = min(1, len(dataset))
-        subset_indices = list(range(num_indices))
+        subset_indices = random.sample(range(len(dataset)), num_indices)
+        print(f"Optimizing embeddings images: {subset_indices}")
         subset_dataset = Subset(dataset, subset_indices)
         dataloader = DataLoader(
             subset_dataset,
@@ -153,7 +159,7 @@ if __name__ == "__main__":
     ap.add_argument("--logs_dir", type=Path, default="logs",
                     help="Directory to save logs.")
     ap.add_argument("--param", type=str, default="eps",
-                    help="Parameterization for calculation loss: x0, eps, v.")
+                    help="Parameterization for calculation loss: x0, eps, v, or eps_attn")
     ap.add_argument("--optimize_embeddings", action="store_true",
                     help="If set, embeddings will be optimized.")
     ap.add_argument("--prompt", type=str, default="grape",

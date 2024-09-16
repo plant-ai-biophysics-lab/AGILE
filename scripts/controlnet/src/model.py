@@ -1000,7 +1000,7 @@ class LatentDiffusion(DDPM):
         else:
             y = None
 
-        if self.model.conditioning_key is not None and not self.force_null_conditioning: # TODO: I think I need to remove this (make text embedding as model parameter)
+        if self.model.conditioning_key is not None and not self.force_null_conditioning:
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
@@ -1193,6 +1193,9 @@ class LatentDiffusion(DDPM):
             
             # update loss dict
             loss_dict.update({f'{prefix}/attn_loss': attn_loss})
+            
+            # log updated loss
+            loss_dict.update({f'{prefix}/loss_with_attn': loss})
 
         return loss, loss_dict
     
@@ -1658,7 +1661,7 @@ class ControlLDM(LatentDiffusion):
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            if optimizing: # TODO: Set this to true during DDPM process
+            if optimizing:
                 with torch.enable_grad():
                     control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt, optimizing=optimizing)
                     control = [c * scale for c, scale in zip(control, self.control_scales)]
@@ -2112,7 +2115,7 @@ class TextEmbeddingOptimizer:
         lr,
         ddim_steps,
         unconditional_guidance_scale,
-        timestep_to_optimize='timestep_10',
+        timestep_to_optimize='timestep_10', # TODO: Try optimizing at an earlier timestep
         logs_dir='optimize_logs',
         optimization_steps=100,
         *args, **kwargs
@@ -2155,7 +2158,7 @@ class TextEmbeddingOptimizer:
                     for attn_type, values in attn_map[0].items():
                         if attn_type == self.att_type:
                             # keep only class token
-                            values = values[:, :, 0]
+                            values = values[:, :, 0] # TODO: use the first token (grape)
                             a_map = values.mean(dim=0)
                             map_size = int(math.sqrt(a_map.shape[-1]))
                             a_map = a_map.view(map_size, map_size)

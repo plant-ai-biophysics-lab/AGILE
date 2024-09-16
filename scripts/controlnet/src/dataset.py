@@ -104,7 +104,7 @@ class ControlNetDataset(Dataset):
         attn_map = np.array(attn_map).astype(np.float32) / 255.0
 
         return dict(
-            jpg=target_image,
+            jpg=source_image,
             txt=prompt,
             hint=source_image,
             source_path=source_image_path,

@@ -1054,7 +1054,6 @@ class CrossAttention(nn.Module):
             out = self.to_out(out)
         
         if return_attn_weights:
-            # return out, sim[:, :, 0]  # only return class token
             return out, sim
         else:
             return out  

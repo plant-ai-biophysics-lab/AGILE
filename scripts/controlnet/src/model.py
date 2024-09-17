@@ -2323,3 +2323,26 @@ class TextEmbeddingOptimizer:
         ax[2].set_title('Source Attention Map')
 
         plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+        
+class AttentionGuidance:
+    
+    def __init__(self):
+        pass
+    
+    def parse_attn_maps(self):
+        pass
+    
+    def train(self):
+        # forward pass with control parameter
+        
+        # apply gaussian weights to attention maps (timestep 50-30)
+        
+        # parse resulting attention maps (timestep 30)
+        
+        # apply mse loss
+        
+        # backward
+        pass
+    
+    def log_images(self):
+        pass

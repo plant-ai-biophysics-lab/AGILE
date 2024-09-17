@@ -49,7 +49,6 @@ class ImageLogger(Callback):
                 hasattr(pl_module, "log_images") and
                 callable(pl_module.log_images) and
                 self.max_images > 0):
-            logger = type(pl_module.logger)
 
             is_train = pl_module.training
             if is_train:

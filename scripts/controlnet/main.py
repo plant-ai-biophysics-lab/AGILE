@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Subset
 from src.util import create_model, load_state_dict, PermuteTransform, initialize_weights
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
-from src.model import TextEmbeddingOptimizer
+from src.model import TextEmbeddingOptimizer, AttentionGuidance
 from lightning.pytorch.loggers import WandbLogger
 
 def main(args):
@@ -123,7 +123,7 @@ def main(args):
         subset_indices = random.sample(range(len(dataset)), num_indices)
         print(f"Optimizing embeddings images: {subset_indices}")
         subset_dataset = Subset(dataset, subset_indices)
-        dataloader = DataLoader(
+        optimize_dataloader = DataLoader(
             subset_dataset,
             num_workers=0,
             batch_size=args.batch_size,
@@ -131,7 +131,30 @@ def main(args):
         )
         
         # Initialize Trainer for embedding optimization
-        text_optimizer.train(dataloader, num_epochs=args.optimize_epochs)
+        text_optimizer.train(optimize_dataloader, num_epochs=args.optimize_epochs)
+        
+    if args.control_attentions:
+        # Set up the Wandb logger for embedding optimization
+        wandb.init(
+            entity='paibl',
+            project='controlnet',
+            name=f"{args.logs_dir.name}_attention_guidance",
+            dir=args.logs_dir,
+            resume=False
+        )
+        
+        # Initialize Text Embedding Optimizer
+        attention_guidance = AttentionGuidance(
+            prompt=prompt,
+            model=model,
+            batch_size=args.batch_size,
+            lr=0.01,
+            ddim_steps=50,
+            unconditional_guidance_scale=20.0,
+            logs_dir=os.path.join(args.logs_dir, "attention_guidance")
+        )
+        
+        attention_guidance.train(dataloader, num_epochs=args.control_epochs)
         
 if __name__ == "__main__":
     
@@ -170,6 +193,10 @@ if __name__ == "__main__":
                     help="Number of optimization steps.")
     ap.add_argument("--prompt_embedding", type=Path, default=None,
                     help="Path to optimized prompt embedding.")
+    ap.add_argument("--control_attentions", type=bool, default=False,
+                    help="If set, control attentions will be used.")
+    ap.add_argument("--control_epochs", type=int, default=10,
+                    help="Number of epochs for optimizing control attentions.")
     # TODO: Add args for strength and unconditional guidance scale
     # TODO: Add args to generate final images
     args = ap.parse_args()

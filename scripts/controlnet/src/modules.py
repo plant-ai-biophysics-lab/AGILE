@@ -1535,7 +1535,8 @@ class DDIMSamplerWithGrad(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     dynamic_threshold=dynamic_threshold,
-                                                    ucg_schedule=ucg_schedule
+                                                    ucg_schedule=ucg_schedule,
+                                                    **kwargs
                                                     )
         return samples, intermediates
 
@@ -1545,7 +1546,7 @@ class DDIMSamplerWithGrad(object):
                       mask=None, x0=None, img_callback=None, log_every_t=10,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
-                      ucg_schedule=None):
+                      ucg_schedule=None, **kwargs):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -1586,7 +1587,7 @@ class DDIMSamplerWithGrad(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold)
+                                      dynamic_threshold=dynamic_threshold, **kwargs)
             img, pred_x0, attn_maps = outs
 
             if callback: callback(i)
@@ -1602,11 +1603,18 @@ class DDIMSamplerWithGrad(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                     temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                     unconditional_guidance_scale=1., unconditional_conditioning=None,
-                    dynamic_threshold=None, use_checkpoint=True):
+                    dynamic_threshold=None, use_checkpoint=True, **kwargs):
         b, *_, device = *x.shape, x.device
+        
+        # check if `control_attentions` is True in kwargs
+        if 'control_attentions' in kwargs:
+            control_attentions = kwargs['control_attentions']
+        else:
+            control_attentions = False
 
-        def forward_model(x_in, t_in, c_in):
-            # This function encapsulates the forward pass
+        def forward_model(x_in, t_in, c_in, control_attentions):
+            if control_attentions:
+                return self.model.apply_model(x_in, t_in, c_in, save_attention=True, control_attentions=True)
             return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=True)
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
@@ -1614,9 +1622,9 @@ class DDIMSamplerWithGrad(object):
             if use_checkpoint:
                 # check if inputs need grads
                 # print('input gradients:', x.requires_grad, t.requires_grad, c.requires_grad)
-                model_output, attn_maps = checkpoint(forward_model, x, t, c)
+                model_output, attn_maps = checkpoint(forward_model, x, t, c, control_attentions)
             else:
-                model_output, attn_maps = forward_model(x, t, c)
+                model_output, attn_maps = forward_model(x, t, c, control_attentions)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)

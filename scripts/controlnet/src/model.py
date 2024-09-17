@@ -2326,14 +2326,124 @@ class TextEmbeddingOptimizer:
         
 class AttentionGuidance:
     
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        prompt,
+        model,
+        batch_size,
+        lr,
+        ddim_steps,
+        unconditional_guidance_scale,
+        timestep_to_optimize='timestep_30',
+        logs_dir='control_logs',
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.model = model.train()
+        self.batch_size = batch_size
+        self.lr = lr
+        self.ddim_steps = ddim_steps
+        self.unconditional_guidance_scale = unconditional_guidance_scale
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.logs_dir = logs_dir
+        self.prompt = prompt
+        
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
+        
+        self.model = self.model.to(self.device)
+        
+        # For control parameters
+        self.timestep_to_optimize = timestep_to_optimize
+        self.att_type = 'attn2'
+        self.target_size = (512, 512)
+        
+        # Loss function
+        self.mse_loss = nn.MSELoss()
+        
+        # clear torch cache
+        torch.cuda.empty_cache()
     
-    def parse_attn_maps(self):
-        pass
+    def parse_attn_maps(self, attn_maps, timestep_to_optimize):
+        
+        for _, attn_map_step in enumerate(attn_maps):
+            (timestep, attn_map_layers), = attn_map_step.items()
+            if timestep == timestep_to_optimize:
+                all_maps_in_layer = []
+                attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
+                for _, (_, attn_map) in enumerate(attn_map_layers.items()):
+                    for attn_type, values in attn_map[0].items():
+                        if attn_type == self.att_type:
+                            # keep only class token
+                            values = values[:, :, 1] # TODO: use the first token (grape)
+                            a_map = values.mean(dim=0)
+                            map_size = int(math.sqrt(a_map.shape[-1]))
+                            a_map = a_map.view(map_size, map_size)
+                            a_map = a_map.unsqueeze(0).unsqueeze(0)
+                            a_map = nn.functional.interpolate(
+                                a_map, size=self.target_size, mode='bilinear', align_corners=False)
+                            a_map = a_map.squeeze(0).squeeze(0)
+                            all_maps_in_layer.append(a_map)
+
+                all_maps_in_layer = torch.stack(all_maps_in_layer, dim=0)
+                all_maps_in_layer = all_maps_in_layer.mean(dim=0)
+
+                # Normalize between 0 and 1
+                all_maps_in_layer = (all_maps_in_layer - all_maps_in_layer.min()) / (
+                        all_maps_in_layer.max() - all_maps_in_layer.min())
+
+                break
+
+        return all_maps_in_layer
     
-    def train(self):
+    def train(self, dataloader, num_epochs):
+        # initialize optimizers
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr)
+        
+        # get prompt embedding
+        if isinstance(self.prompt, torch.Tensor):
+            print("Using optimized embedding!")
+            text_embedding = self.prompt.clone().detach().to(self.device)
+        else:
+            latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
+            text_embedding = latent_from_prompt.clone().detach().to(self.device)
+        
         # forward pass with control parameter
+        for epoch in range(num_epochs):
+            for batch_idx, batch in enumerate(dataloader):
+                N = self.batch_size
+                use_ddim = self.ddim_steps is not None
+                
+                # Get input data
+                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                c_cat = c["c_concat"][0][:N]
+                uc_cross = self.model.get_unconditional_conditioning(N)
+                uc_cat = c_cat
+                uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
+                
+                generated, intermediates = self.model.sample_log_with_grad(
+                    cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
+                    batch_size=N, ddim=use_ddim,
+                    ddim_steps=self.ddim_steps,
+                    unconditional_guidance_scale=self.unconditional_guidance_scale,
+                    unconditional_conditioning=uc_full,
+                    control_attentions=True
+                )
+                
+                # Post process the generated result
+                generated = self.model.decode_first_stage(generated)
+                source_attn_map = intermediates['attn_maps']
+                source_attn_map = self.parse_attn_maps(source_attn_map, self.timestep_to_optimize).to(self.device)
+                target_attn_map = batch['attn_map'].squeeze(0).to(self.device)
+                
+                # Compute loss and backward pass
+                loss = self.mse_loss(source_attn_map, target_attn_map)
+                loss.backward()
+                optimizer.step()
+                
+            # Log images every 10 steps
+            if epoch % 5 == 0:
+                self.log_images(generated, target_attn_map, source_attn_map, batch_idx, epoch)
         
         # apply gaussian weights to attention maps (timestep 50-30)
         
@@ -2344,5 +2454,23 @@ class AttentionGuidance:
         # backward
         pass
     
-    def log_images(self):
-        pass
+    def log_images(self, generated, target_attn_map, source_attn_map, idx, opt_steps):
+        generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+        generated = (generated - generated.min()) / (generated.max() - generated.min())
+        generated = (generated * 255).astype(np.uint8)
+
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+        ax[0].imshow(generated)
+        ax[0].axis('off')
+        ax[0].set_title('Generated Image')
+
+        ax[1].imshow(target_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[1].axis('off')
+        ax[1].set_title('Target Attention Map')
+
+        ax[2].imshow(source_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[2].axis('off')
+        ax[2].set_title('Source Attention Map')
+
+        plt.savefig(f"{self.logs_dir}/control_batch-{idx}_opt-{opt_steps}.png")

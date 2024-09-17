@@ -774,6 +774,7 @@ class LatentDiffusion(DDPM):
         # FOR TEXT EMBEDDING OPTIMIZATION
         self.optimize_embeddings = False
         self.attn_loss_weight = 1.0
+        self.save_attn_counter = 0
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -1185,32 +1186,72 @@ class LatentDiffusion(DDPM):
             source_attn = self.get_avg_attn(attn_maps)
             target_attn = kwargs['attn_map'].squeeze(0)
             
-            # mse loss
+            # visualize source and target attn at every 300 steps
+            if self.save_attn_counter % 250 == 0:
+                self.save_attn(source_attn, target_attn, self.save_attn_counter, timestep=int(t), save_dir=self.logger.save_dir)
+            
             attn_loss = torch.nn.functional.mse_loss(source_attn, target_attn)
-            
-            # add to existing loss
             loss = loss + self.attn_loss_weight*attn_loss
-            
-            # update loss dict
+        
             loss_dict.update({f'{prefix}/attn_loss': attn_loss})
-            
-            # log updated loss
             loss_dict.update({f'{prefix}/loss_with_attn': loss})
+            self.save_attn_counter += 1
 
         return loss, loss_dict
+    
+    @staticmethod
+    def save_attn(source_attn, target_attn, global_step, timestep, save_dir):
+        
+        # check in save_dir if global step already exists
+        if os.path.exists(f'{save_dir}/attn_loss'):
+            for file in os.listdir(f'{save_dir}/attn_loss'):
+                if f'step-{global_step}' in file:
+                    return
+        
+        # apply viridis colormap
+        source_attn = plt.cm.viridis(source_attn.detach().cpu().numpy())
+        target_attn = plt.cm.viridis(target_attn.detach().cpu().numpy())
+
+        # convert to images (already normalized between 0-1 so * 255 for RGB)
+        source_attn_img = (source_attn * 255).astype(np.uint8)
+        target_attn_img = (target_attn * 255).astype(np.uint8)
+
+        # Create a plot
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))  # 1 row, 2 columns for side-by-side plots
+
+        # Plot source attention
+        axes[0].imshow(source_attn_img)
+        axes[0].set_title('Source Attention', fontsize=14)
+        axes[0].axis('off')  # Remove axis
+
+        # Plot target attention
+        axes[1].imshow(target_attn_img)
+        axes[1].set_title('Target Attention', fontsize=14)
+        axes[1].axis('off')  # Remove axis
+
+        # Adjust the layout to add space between the plots
+        plt.subplots_adjust(wspace=0.3)
+
+        # Create save_dir if it does not exist
+        if not os.path.exists(f'{save_dir}/attn_loss'):
+            os.makedirs(f'{save_dir}/attn_loss')
+
+        # Save the combined plot as an image
+        plt.savefig(f'{save_dir}/attn_loss/attn_t-{timestep}_step-{global_step}.png', bbox_inches='tight', pad_inches=0.1)
+        plt.close()
     
     @staticmethod
     def get_avg_attn(attn_maps, type='attn2', target_size=(512, 512)):
         avg_maps = []
         
         # remove if not needed
-        # attn_maps = {key: attn_maps[key] for key in [7,8]}
+        attn_maps = {key: attn_maps[key] for key in [8]} # TODO: only using layer 8 instead of avg
         
         for _, (_, attn_map) in enumerate(attn_maps.items()):
             for attn_type, values in attn_map[0].items():
                 if attn_type == type:
                     # keep only class token
-                    values = values[:, :, 0]
+                    values = values[:, :, 1] # TODO: use the first token (grape)
                     a_map = values.mean(dim=0)
                     map_size = int(math.sqrt(a_map.shape[-1]))
                     a_map = a_map.view(map_size, map_size)
@@ -2115,7 +2156,7 @@ class TextEmbeddingOptimizer:
         lr,
         ddim_steps,
         unconditional_guidance_scale,
-        timestep_to_optimize='timestep_10', # TODO: Try optimizing at an earlier timestep
+        timestep_to_optimize='timestep_30', # TODO: Try optimizing at an earlier timestep
         logs_dir='optimize_logs',
         optimization_steps=100,
         *args, **kwargs
@@ -2150,15 +2191,17 @@ class TextEmbeddingOptimizer:
         torch.cuda.empty_cache()
 
     def parse_attn_maps(self, attn_maps, timestep_to_optimize):
+        
         for _, attn_map_step in enumerate(attn_maps):
             (timestep, attn_map_layers), = attn_map_step.items()
             if timestep == timestep_to_optimize:
                 all_maps_in_layer = []
+                attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
                 for _, (_, attn_map) in enumerate(attn_map_layers.items()):
                     for attn_type, values in attn_map[0].items():
                         if attn_type == self.att_type:
                             # keep only class token
-                            values = values[:, :, 0] # TODO: use the first token (grape)
+                            values = values[:, :, 1] # TODO: use the first token (grape)
                             a_map = values.mean(dim=0)
                             map_size = int(math.sqrt(a_map.shape[-1]))
                             a_map = a_map.view(map_size, map_size)
@@ -2206,7 +2249,7 @@ class TextEmbeddingOptimizer:
                 use_ddim = self.ddim_steps is not None
 
                 # Get input data
-                _, _, c = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
                 c_cat = c["c_concat"][0][:N]
 
                 uc_cross = self.model.get_unconditional_conditioning(N)

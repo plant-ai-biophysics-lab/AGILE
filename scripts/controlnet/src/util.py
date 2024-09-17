@@ -313,7 +313,7 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
                     
                     # get the attention map
                     # a_map = values[num_heads:].mean(dim=0) # remove unconditional head and take the mean
-                    values = values[:, :, 0] # keep only the class token # TODO: use the first token (grape)
+                    values = values[:, :, 1] # keep only the class token # TODO: use the first token (grape)
                     a_map = values.mean(dim=0) # take the mean
                     
                     # reshape into grid

@@ -38,7 +38,7 @@ def main(args):
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
-    model.attn_loss_weight = 2.0
+    model.attn_loss_weight = 1.0
     
     strength = 1.0
     model.control_scales = ([strength] * 13)
@@ -119,7 +119,7 @@ def main(args):
         )
         
         # Use subset of dataloader
-        num_indices = min(1, len(dataset))
+        num_indices = min(3, len(dataset))
         subset_indices = random.sample(range(len(dataset)), num_indices)
         print(f"Optimizing embeddings images: {subset_indices}")
         subset_dataset = Subset(dataset, subset_indices)

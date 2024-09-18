@@ -1245,7 +1245,7 @@ class LatentDiffusion(DDPM):
         avg_maps = []
         
         # remove if not needed
-        attn_maps = {key: attn_maps[key] for key in [8]} # TODO: only using layer 8 instead of avg
+        # attn_maps = {key: attn_maps[key] for key in [8]} # TODO: only using layer 8 instead of avg
         
         for _, (_, attn_map) in enumerate(attn_maps.items()):
             for attn_type, values in attn_map[0].items():
@@ -1860,7 +1860,7 @@ class ControlledUnetModel(UNetModel):
         
         hs = []
         # layers_to_save = [7, 8, 9, 10]
-        layers_to_save = [5, 6, 7, 8]
+        layers_to_save = [3, 5, 8, 11]
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)

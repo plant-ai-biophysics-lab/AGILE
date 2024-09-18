@@ -986,23 +986,35 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, target_size=(512, 512)):
+    def apply_attention_edit(self, sim_target, gaussian_map, alpha=0.3):
 
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads = sim_target.shape[0]
         num_tokens = sim_target.shape[2]
 
+        # Reshape sim_target to (num_heads, map_size, map_size, num_tokens)
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
 
+        # Extract the attention map for token position 1 (shape: [num_heads, map_size, map_size])
+        sim_token_1 = sim_target[:, 1, :, :]
+
+        # Apply Gaussian map to token position 1 only
         gaussian_map = gaussian_map.unsqueeze(0).unsqueeze(0)
-        
         if gaussian_map.shape[2:] != (map_size, map_size):
             gaussian_map = nn.functional.interpolate(
                 gaussian_map, size=(map_size, map_size), mode='bilinear', align_corners=False
             )
-        
-        sim_target = sim_target * gaussian_map
 
+        # Ensure Gaussian map values are at least 0.1
+        gaussian_map = torch.clamp(gaussian_map, min=alpha)
+
+        # Apply modified Gaussian map to token 1
+        sim_token_1 = sim_token_1 * gaussian_map.squeeze(0)  # Broadcasting Gaussian map over token 1
+
+        # Replace token 1 back into the original sim_target
+        sim_target[:, 1, :, :] = sim_token_1
+
+        # Reshape back to the original shape (num_heads, dimensions, num_tokens)
         sim_target = sim_target.permute(0, 2, 3, 1).view(num_heads, -1, num_tokens)
 
         return sim_target

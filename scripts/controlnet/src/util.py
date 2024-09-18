@@ -284,7 +284,7 @@ class PermuteTransform:
         else:
             return np.transpose(x, (0, 1, 2))
     
-def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
+def get_attn_maps(attn_maps, num_layers = 4):
     
     # store attention type into a display grid (columns: timesteps and rows: layers)
     
@@ -293,7 +293,7 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
     att_types = ['attn2']
     target_size = (512, 512)
     column_titles = []
-    row_titles = ['Layer 7', 'Layer 8', 'Layer 9', 'Layer 10', 'Average']
+    row_titles = ['Layer 5', 'Layer 6', 'Layer 7', 'Layer 8', 'Average']
     
     # iterate attn map for each timestep
     for i, attn_map_step in enumerate(attn_maps):
@@ -312,7 +312,6 @@ def get_attn_maps(attn_maps, num_heads = 8, num_layers = 4):
                 if attn_type in att_types:
                     
                     # get the attention map
-                    # a_map = values[num_heads:].mean(dim=0) # remove unconditional head and take the mean
                     values = values[:, :, 1] # keep only the class token # TODO: use the first token (grape)
                     a_map = values.mean(dim=0) # take the mean
                     

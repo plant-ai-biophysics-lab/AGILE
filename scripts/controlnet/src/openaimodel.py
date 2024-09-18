@@ -70,13 +70,15 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
 
     def forward(self, x, emb, context=None, **kwargs):
         optimizing = kwargs['optimizing'] if 'optimizing' in kwargs else False
+        control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
+        gaussian_map = kwargs['gaussian_map'] if 'gaussian_map' in kwargs else None
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb) # TODO: Use pytorch checkpoint                                    
             elif isinstance(layer, SpatialTransformer):
                 # check if 'layer' is in kwargs
                 if 'layer' in kwargs:
-                    x, attn_maps = layer(x, context, layer=kwargs['layer'], optimizing=optimizing)
+                    x, attn_maps = layer(x, context, layer=kwargs['layer'], optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map)
                 else:
                     x = layer(x, context, optimizing=optimizing)
             else:

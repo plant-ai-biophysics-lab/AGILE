@@ -38,9 +38,9 @@ def main(args):
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
-    model.attn_loss_weight = 1.0
+    model.attn_loss_weight = 5.0
     
-    strength = 1.0
+    strength = 3.0
     model.control_scales = ([strength] * 13)
     
     print(f"Using parameterization: {model.parameterization}")
@@ -71,6 +71,9 @@ def main(args):
     
     logger = ImageLogger(epoch_frequency=args.logger_freq)
     logger.train_dataloader = dataloader
+    logger.log_images_kwargs = {
+        "control_attentions": True
+    }
     
     # prepare wandb logger
     wandb_logger = WandbLogger(

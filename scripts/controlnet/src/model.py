@@ -1,6 +1,7 @@
 import torch
 import einops
 import copy
+import cv2
 import torch.nn as nn
 import numpy as np
 import tqdm
@@ -1201,13 +1202,13 @@ class LatentDiffusion(DDPM):
     
     @staticmethod
     def save_attn(source_attn, target_attn, global_step, timestep, save_dir):
-        
+    
         # check in save_dir if global step already exists
         if os.path.exists(f'{save_dir}/attn_loss'):
             for file in os.listdir(f'{save_dir}/attn_loss'):
                 if f'step-{global_step}' in file:
                     return
-        
+                
         # apply viridis colormap
         source_attn = plt.cm.viridis(source_attn.detach().cpu().numpy())
         target_attn = plt.cm.viridis(target_attn.detach().cpu().numpy())
@@ -1725,10 +1726,12 @@ class ControlLDM(LatentDiffusion):
                 control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if save_attention:
-                    eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                    eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
+                                                           control_attentions=control_attentions, gaussian_map=gaussian_map)
                     return eps, attn_maps_layer
                 else:
-                    eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                    eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map)
                     return eps
 
     @torch.no_grad()
@@ -1795,7 +1798,8 @@ class ControlLDM(LatentDiffusion):
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
-                                             unconditional_conditioning=uc_full
+                                             unconditional_conditioning=uc_full,
+                                             **kwargs
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             x_samples_attn_maps = get_attn_maps(intermediates['attn_maps'])

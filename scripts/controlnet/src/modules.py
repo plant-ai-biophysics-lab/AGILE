@@ -191,7 +191,8 @@ class DDIMSampler(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     dynamic_threshold=dynamic_threshold,
-                                                    ucg_schedule=ucg_schedule
+                                                    ucg_schedule=ucg_schedule,
+                                                    **kwargs
                                                     )
         return samples, intermediates
 
@@ -202,7 +203,7 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=10,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
-                      ucg_schedule=None):
+                      ucg_schedule=None, **kwargs):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -242,7 +243,7 @@ class DDIMSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold)
+                                      dynamic_threshold=dynamic_threshold, **kwargs)
             img, pred_x0, attn_maps = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -258,8 +259,20 @@ class DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      dynamic_threshold=None):
+                      dynamic_threshold=None, **kwargs):
         b, *_, device = *x.shape, x.device
+        
+        # check if `control_attentions` is True in kwargs
+        if 'control_attentions' in kwargs:
+            control_attentions = kwargs['control_attentions']
+        else:
+            control_attentions = False
+            
+        # check if gaussian_map is in kwargs
+        if 'gaussian_map' in kwargs:
+            gaussian_map = kwargs['gaussian_map']
+        else:
+            gaussian_map = None
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             model_output = self.model.apply_model(x, t, c)
@@ -304,7 +317,8 @@ class DDIMSampler(object):
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
             # model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in, save_attention=True).chunk(2) 
-            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True)
+            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True,
+                                                               control_attentions=control_attentions, gaussian_map=gaussian_map)
             model_uncond, model_t = model_uncond_t.chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 
@@ -995,26 +1009,29 @@ class CrossAttention(nn.Module):
         # Reshape sim_target to (num_heads, map_size, map_size, num_tokens)
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
 
-        # Extract the attention map for token position 1 (shape: [num_heads, map_size, map_size])
-        sim_token_1 = sim_target[:, 1, :, :]
-
-        # Apply Gaussian map to token position 1 only
+        # Prepare the Gaussian map
         gaussian_map = gaussian_map.unsqueeze(0).unsqueeze(0)
         if gaussian_map.shape[2:] != (map_size, map_size):
             gaussian_map = nn.functional.interpolate(
                 gaussian_map, size=(map_size, map_size), mode='bilinear', align_corners=False
             )
+        
+        # Create a mask where the Gaussian map has non-zero values
+        mask = gaussian_map.squeeze(0) > 0.3
 
-        # Ensure Gaussian map values are at least 0.1
-        gaussian_map = torch.clamp(gaussian_map, min=alpha)
+        # Add the Gaussian map for token 1, and clamp the final values between 0 and 1
+        sim_token_1 = sim_target[:, 1, :, :]  # Get token 1
+        sim_token_1 = torch.where(mask, sim_token_1 + gaussian_map.squeeze(0), sim_token_1)  # Add where mask is True
+        sim_token_1 = torch.clamp(sim_token_1, min=0.0, max=1.0)  # Clamp to ensure values are between 0 and 1
+        sim_target[:, 1, :, :] = sim_token_1  # Place it back into sim_target
 
-        # Apply modified Gaussian map to token 1
-        sim_token_1 = sim_token_1 * gaussian_map.squeeze(0)  # Broadcasting Gaussian map over token 1
-
-        # Replace token 1 back into the original sim_target
-        sim_target[:, 1, :, :] = sim_token_1
-
-        # Reshape back to the original shape (num_heads, dimensions, num_tokens)
+        # # Add the Gaussian map for tokens after the 14th token, and clamp the final values between 0 and 1
+        # sim_tokens_after_14 = sim_target[:, 15:, :, :]  # Get tokens after 14th
+        # sim_tokens_after_14 = torch.where(mask, sim_tokens_after_14 + gaussian_map.squeeze(0), sim_tokens_after_14 * alpha)  # Add Gaussian map where mask is True, else add alpha
+        # sim_tokens_after_14 = torch.clamp(sim_tokens_after_14, min=0.0, max=1.0)  # Clamp to ensure values are between 0 and 1
+        # sim_target[:, 15:, :, :] = sim_tokens_after_14  # Place it back into sim_target
+        
+        # Reshape back to the original shape (num_heads, dimensions, num_tokens) 
         sim_target = sim_target.permute(0, 2, 3, 1).view(num_heads, -1, num_tokens)
 
         return sim_target
@@ -1068,25 +1085,19 @@ class CrossAttention(nn.Module):
         else:
             
             h = self.heads
-
             q = self.to_q(x)
             context = default(context, x)
             k = self.to_k(context)
             v = self.to_v(context)
-
             q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-            def checkpointed_attention(q, k, v):
-                return self.attention(q, k, v, mask)
+            def checkpointed_attention(q, k, v, control_attentions, gaussian_map):
+                    return self.attention(q, k, v, control_attentions, gaussian_map, mask)
 
             if self.use_checkpoint:
-                out, sim = checkpoint(checkpointed_attention, (q, k, v), (), self.use_checkpoint)
+                out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map), (), self.use_checkpoint)
             else:
-                out, sim = checkpointed_attention(q, k, v)
-                
-            # delete variables and clear cache
-            del q, k, v
-            torch.cuda.empty_cache()
+                out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map)
             
             out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
             
@@ -1172,7 +1183,7 @@ class BasicTransformerBlock(nn.Module):
             # self.attn_maps['attn1'] = attn1_weights  # Store the attention weights
             x = attn1_output + x  # Update x with the output of attn1
 
-            attn2_output, attn2_weights = self.attn2(self.norm2(x), context=context, return_attn_weights=True, optimize=optimize)
+            attn2_output, attn2_weights = self.attn2(self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions, gaussian_map=gaussian_map)
             attn_maps = {'attn2': attn2_weights}
             x = attn2_output + x  # Update x with the output of attn2
 

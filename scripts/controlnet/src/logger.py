@@ -55,6 +55,8 @@ class ImageLogger(Callback):
                 pl_module.eval()
 
             with torch.no_grad():
+                # add gaussian map to kwargs
+                self.log_images_kwargs["gaussian_map"] = batch['attn_map'].squeeze(0)
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
 
             for k in images:

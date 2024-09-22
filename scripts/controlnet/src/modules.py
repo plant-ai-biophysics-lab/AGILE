@@ -1000,41 +1000,38 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, alpha=0.3):
-
+    def apply_attention_edit(self, sim_target, gaussian_map):
+        
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads = sim_target.shape[0]
         num_tokens = sim_target.shape[2]
 
-        # Reshape sim_target to (num_heads, map_size, map_size, num_tokens)
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
-
-        # Prepare the Gaussian map
         gaussian_map = gaussian_map.unsqueeze(0).unsqueeze(0)
         if gaussian_map.shape[2:] != (map_size, map_size):
             gaussian_map = nn.functional.interpolate(
                 gaussian_map, size=(map_size, map_size), mode='bilinear', align_corners=False
             )
-        
-        # Create a mask where the Gaussian map has non-zero values
+
+        # Create a mask where the Gaussian map has values greater than 0.3
         mask = gaussian_map.squeeze(0) > 0.3
+        sim_token_1 = sim_target[:, 1, :, :]
 
-        # Add the Gaussian map for token 1, and clamp the final values between 0 and 1
-        sim_token_1 = sim_target[:, 1, :, :]  # Get token 1
-        sim_token_1 = torch.where(mask, sim_token_1 + gaussian_map.squeeze(0), sim_token_1)  # Add where mask is True
-        sim_token_1 = torch.clamp(sim_token_1, min=0.0, max=1.0)  # Clamp to ensure values are between 0 and 1
-        sim_target[:, 1, :, :] = sim_token_1  # Place it back into sim_target
+        # Perform the addition where mask is True
+        sim_token_1 = torch.where(
+            mask, sim_token_1 + gaussian_map.squeeze(0), sim_token_1
+        )
 
-        # # Add the Gaussian map for tokens after the 14th token, and clamp the final values between 0 and 1
-        # sim_tokens_after_14 = sim_target[:, 15:, :, :]  # Get tokens after 14th
-        # sim_tokens_after_14 = torch.where(mask, sim_tokens_after_14 + gaussian_map.squeeze(0), sim_tokens_after_14 * alpha)  # Add Gaussian map where mask is True, else add alpha
-        # sim_tokens_after_14 = torch.clamp(sim_tokens_after_14, min=0.0, max=1.0)  # Clamp to ensure values are between 0 and 1
-        # sim_target[:, 15:, :, :] = sim_tokens_after_14  # Place it back into sim_target
+        sim_token_1 = torch.clamp(sim_token_1, min=0.0, max=1.0)
         
-        # Reshape back to the original shape (num_heads, dimensions, num_tokens) 
-        sim_target = sim_target.permute(0, 2, 3, 1).view(num_heads, -1, num_tokens)
+        # Create a new copy of sim_target instead of modifying it in-place
+        sim_target_copy = sim_target.clone()
+        sim_target_copy[:, 1, :, :] = sim_token_1
+        
+        # Return the new copy with modifications
+        sim_target_copy = sim_target_copy.permute(0, 2, 3, 1).view(num_heads, -1, num_tokens)
 
-        return sim_target
+        return sim_target_copy
 
     def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None):
         if self._ATTN_PRECISION == "fp32":

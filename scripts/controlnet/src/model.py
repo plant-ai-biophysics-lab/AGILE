@@ -1149,6 +1149,7 @@ class LatentDiffusion(DDPM):
 
         if self.parameterization == "eps_attn":
             model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True, control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0))
+            # model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0))
         else:
             model_output = self.apply_model(x_noisy, t, cond)
 
@@ -1164,7 +1165,7 @@ class LatentDiffusion(DDPM):
         else:
             raise NotImplementedError()
 
-        # get diffusion loss
+        # Get diffusion loss
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3]) 
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
@@ -1182,18 +1183,18 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
         
-        # get attention loss
+        # Get attention loss
         if self.parameterization == "eps_attn":
-            source_attn = self.get_avg_attn(attn_maps)
+            avg_attn, all_token_attns = self.get_avg_attn(attn_maps)
             target_attn = kwargs['attn_map'].squeeze(0)
-            
-            # visualize source and target attn at every 300 steps
+
+            # Visualize source and target attn at every 250 steps
             if self.save_attn_counter % 250 == 0:
-                self.save_attn(source_attn, target_attn, self.save_attn_counter, timestep=int(t), save_dir=self.logger.save_dir)
+                self.save_attn(avg_attn, target_attn, all_token_attns, self.save_attn_counter, timestep=int(t), save_dir=self.logger.save_dir)
             
-            attn_loss = torch.nn.functional.mse_loss(source_attn, target_attn)
-            loss = loss + self.attn_loss_weight*attn_loss
-        
+            attn_loss = torch.nn.functional.mse_loss(avg_attn, target_attn)
+            loss = loss + self.attn_loss_weight * attn_loss
+
             loss_dict.update({f'{prefix}/attn_loss': attn_loss})
             loss_dict.update({f'{prefix}/loss_with_attn': loss})
             self.save_attn_counter += 1
@@ -1201,75 +1202,113 @@ class LatentDiffusion(DDPM):
         return loss, loss_dict
     
     @staticmethod
-    def save_attn(source_attn, target_attn, global_step, timestep, save_dir):
-    
-        # check in save_dir if global step already exists
-        if os.path.exists(f'{save_dir}/attn_loss'):
-            for file in os.listdir(f'{save_dir}/attn_loss'):
-                if f'step-{global_step}' in file:
-                    return
-                
-        # apply viridis colormap
-        source_attn = plt.cm.viridis(source_attn.detach().cpu().numpy())
-        target_attn = plt.cm.viridis(target_attn.detach().cpu().numpy())
-
-        # convert to images (already normalized between 0-1 so * 255 for RGB)
-        source_attn_img = (source_attn * 255).astype(np.uint8)
-        target_attn_img = (target_attn * 255).astype(np.uint8)
-
-        # Create a plot
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))  # 1 row, 2 columns for side-by-side plots
-
-        # Plot source attention
-        axes[0].imshow(source_attn_img)
-        axes[0].set_title('Source Attention', fontsize=14)
-        axes[0].axis('off')  # Remove axis
-
-        # Plot target attention
-        axes[1].imshow(target_attn_img)
-        axes[1].set_title('Target Attention', fontsize=14)
-        axes[1].axis('off')  # Remove axis
-
-        # Adjust the layout to add space between the plots
-        plt.subplots_adjust(wspace=0.3)
-
-        # Create save_dir if it does not exist
+    def save_attn(avg_attn, target_attn, all_token_attns, global_step, timestep, save_dir):
+        # Ensure save_dir exists
         if not os.path.exists(f'{save_dir}/attn_loss'):
             os.makedirs(f'{save_dir}/attn_loss')
 
-        # Save the combined plot as an image
-        plt.savefig(f'{save_dir}/attn_loss/step-{global_step}_time-{timestep}.png', bbox_inches='tight', pad_inches=0.1)
+        # Tokens to visualize: token 0, 1, 10, 20, 40, and 70
+        tokens_to_save = [0, 1, 10, 20, 40, 70]
+
+        # Number of attention maps (each entry in all_token_attns represents a different map)
+        num_attn_maps = len(all_token_attns)
+
+        # Layer titles (for each row, assuming layers 3 to 11)
+        layer_titles = ['Layer 3', 'Layer 4', 'Layer 5', 'Layer 6', 'Layer 7', 'Layer 8', 'Layer 9', 'Layer 10', 'Layer 11']
+
+        # Set grid size: rows = number of attention maps + 1 (for source/target comparison), columns = number of tokens to visualize
+        grid_rows = num_attn_maps + 1  # +1 for source-target comparison
+        grid_cols = len(tokens_to_save)
+
+        # Create a grid plot to show attention maps for selected tokens
+        fig, axes = plt.subplots(grid_rows, grid_cols, figsize=(grid_cols * 3, grid_rows * 3))
+
+        # Ensure axes is a 2D array for easy iteration
+        axes = np.array(axes).reshape(grid_rows, grid_cols)
+
+        ### Plot Source (avg_attn) and Target Attention for Token 1 ###
+        # Convert average attention map to image
+        source_attn_img = plt.cm.viridis(avg_attn.detach().cpu().numpy()) * 255  # Use avg_attn as source attention
+        source_attn_img = source_attn_img.astype(np.uint8)
+
+        target_attn_img = plt.cm.viridis(target_attn.detach().cpu().numpy()) * 255  # Target attention
+        target_attn_img = target_attn_img.astype(np.uint8)
+
+        # Plot source attention (first column)
+        axes[0][0].imshow(source_attn_img)
+        axes[0][0].set_title(f'Source (avg_attn)', fontsize=10)
+        axes[0][0].axis('off')
+
+        # Plot target attention (second column, token 1)
+        axes[0][1].imshow(target_attn_img)
+        axes[0][1].set_title(f'Target Token 1', fontsize=10)
+        axes[0][1].axis('off')
+
+        # Fill in the remaining empty cells in the first row (if any)
+        for col in range(2, grid_cols):
+            axes[0][col].axis('off')
+
+        ### Plot Attention Maps for Each Layer and Token ###
+        for row, attn_map in enumerate(all_token_attns, start=1):  # Start at row 1 because row 0 is for source/target comparison
+            for col, token_idx in enumerate(tokens_to_save):
+                # Get the attention map for the specific token
+                token_attn_img = plt.cm.viridis(attn_map[token_idx].detach().cpu().numpy()) * 255
+                token_attn_img = token_attn_img.astype(np.uint8)
+
+                # Plot the token attention map
+                axes[row][col].imshow(token_attn_img)
+                axes[row][col].set_title(f'Token {token_idx}', fontsize=10)
+                axes[row][col].axis('off')
+
+            # Add the vertical column title to the far right of the grid (Layer 3, 4, etc.)
+            axes[row][0].annotate(layer_titles[row - 1], xy=(0, 0.5), xytext=(-axes[row][0].yaxis.labelpad - 5, 0),
+                                xycoords=axes[row][0].yaxis.label, textcoords='offset points',
+                                size='large', ha='center', va='center', rotation=90)
+
+        # Adjust layout to reduce all unnecessary space, especially at the top
+        plt.subplots_adjust(left=0.1, right=0.9, top=0.95, bottom=0.1, wspace=0.4, hspace=0.4)
+
+        # Save the entire grid as a single image
+        plt.savefig(f'{save_dir}/attn_loss/step-{global_step}_time-{timestep}_tokens_grid.png', bbox_inches='tight', pad_inches=0.1)
         plt.close()
     
     @staticmethod
     def get_avg_attn(attn_maps, type='attn2', target_size=(512, 512)):
+        all_token_attns = []  # Store attention maps for each token for each attention layer/map
         avg_maps = []
-        
-        # remove if not needed
-        # attn_maps = {key: attn_maps[key] for key in [8]} # TODO: only using layer 8 instead of avg
-        
+
         for _, (_, attn_map) in enumerate(attn_maps.items()):
             for attn_type, values in attn_map[0].items():
                 if attn_type == type:
-                    # keep only class token
-                    values = values[:, :, 1] # TODO: use the first token (grape)
-                    a_map = values.mean(dim=0)
-                    map_size = int(math.sqrt(a_map.shape[-1]))
-                    a_map = a_map.view(map_size, map_size)
-                    a_map = a_map.unsqueeze(0).unsqueeze(0)
-                    a_map = nn.functional.interpolate(
-                        a_map, size=target_size, mode='bilinear', align_corners=False)
-                    a_map = a_map.squeeze(0).squeeze(0)
-                    avg_maps.append(a_map)
+                    num_tokens = values.shape[2]  # Number of tokens, assumed to be 77
+                    token_attns = []  # Store individual token attention maps for this layer
 
-        avg_maps = torch.stack(avg_maps, dim=0)
-        avg_maps = avg_maps.mean(dim=0)
+                    # Collect attention maps for all tokens in this map (for example, 77 tokens)
+                    for token_idx in range(num_tokens):
+                        token_attn = values[:, :, token_idx].mean(dim=0)  # Average across heads
+                        map_size = int(math.sqrt(token_attn.shape[-1]))
+                        token_attn = token_attn.view(map_size, map_size)
+                        token_attn = token_attn.unsqueeze(0).unsqueeze(0)
+                        token_attn = nn.functional.interpolate(
+                            token_attn, size=target_size, mode='bilinear', align_corners=False)
+                        token_attn = token_attn.squeeze(0).squeeze(0)
 
-        # Normalize between 0 and 1
-        avg_maps = (avg_maps - avg_maps.min()) / (
-                avg_maps.max() - avg_maps.min())
-        
-        return avg_maps
+                        # Normalize between 0 and 1
+                        token_attn = (token_attn - token_attn.min()) / (token_attn.max() - token_attn.min())
+
+                        token_attns.append(token_attn)  # Save token's attention map for this layer
+
+                    # Save all token attention maps for this layer
+                    all_token_attns.append(token_attns)
+
+                    # Compute average attention map for this layer (over all tokens)
+                    avg_map = torch.stack(token_attns, dim=0).mean(dim=0)
+                    avg_maps.append(avg_map)
+
+        # Compute global average attention map across all layers
+        avg_attn = torch.stack(avg_maps, dim=0).mean(dim=0)
+
+        return avg_attn, all_token_attns
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
@@ -1862,9 +1901,10 @@ class ControlledUnetModel(UNetModel):
         # check if gaussian_map is in kwargs else None
         gaussian_map = kwargs.get('gaussian_map', None)
         
+        # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
-        # layers_to_save = [7, 8, 9, 10]
-        layers_to_save = [3, 5, 8, 11]
+        layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+        layers_to_control = [3, 4, 5, 6, 7, 8]
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -1890,7 +1930,10 @@ class ControlledUnetModel(UNetModel):
             # check if i is in the list of indices where we want to view the attention
             if i in layers_to_save and 'save_attention' in kwargs and kwargs['save_attention']:
                 layer = i
-                h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map)
+                if i in layers_to_control:
+                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map)
+                else:
+                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing)
                 attn_maps_layer[layer] = attn_maps
             else:
                 h = module(h, emb, context)
@@ -2343,166 +2386,3 @@ class TextEmbeddingOptimizer:
         ax[2].set_title('Source Attention Map')
 
         plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
-        
-class AttentionGuidance:
-    
-    def __init__(
-        self,
-        prompt,
-        model,
-        batch_size,
-        lr,
-        ddim_steps,
-        unconditional_guidance_scale,
-        timestep_to_optimize='timestep_30',
-        logs_dir='control_logs',
-        *args, **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.model = model.train()
-        self.batch_size = batch_size
-        self.lr = lr
-        self.ddim_steps = ddim_steps
-        self.unconditional_guidance_scale = unconditional_guidance_scale
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.logs_dir = logs_dir
-        self.prompt = prompt
-        
-        if not os.path.exists(self.logs_dir):
-            os.makedirs(self.logs_dir)
-        
-        self.model = self.model.to(self.device)
-        
-        # For control parameters
-        self.timestep_to_optimize = timestep_to_optimize
-        self.att_type = 'attn2'
-        self.target_size = (512, 512)
-        
-        # Loss function
-        self.mse_loss = nn.MSELoss()
-        
-        # clear torch cache
-        torch.cuda.empty_cache()
-    
-    def parse_attn_maps(self, attn_maps, timestep_to_optimize):
-        
-        for _, attn_map_step in enumerate(attn_maps):
-            (timestep, attn_map_layers), = attn_map_step.items()
-            if timestep == timestep_to_optimize:
-                all_maps_in_layer = []
-                attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
-                for _, (_, attn_map) in enumerate(attn_map_layers.items()):
-                    for attn_type, values in attn_map[0].items():
-                        if attn_type == self.att_type:
-                            # keep only class token
-                            values = values[:, :, 1] # TODO: use the first token (grape)
-                            a_map = values.mean(dim=0)
-                            map_size = int(math.sqrt(a_map.shape[-1]))
-                            a_map = a_map.view(map_size, map_size)
-                            a_map = a_map.unsqueeze(0).unsqueeze(0)
-                            a_map = nn.functional.interpolate(
-                                a_map, size=self.target_size, mode='bilinear', align_corners=False)
-                            a_map = a_map.squeeze(0).squeeze(0)
-                            all_maps_in_layer.append(a_map)
-
-                all_maps_in_layer = torch.stack(all_maps_in_layer, dim=0)
-                all_maps_in_layer = all_maps_in_layer.mean(dim=0)
-
-                # Normalize between 0 and 1
-                all_maps_in_layer = (all_maps_in_layer - all_maps_in_layer.min()) / (
-                        all_maps_in_layer.max() - all_maps_in_layer.min())
-
-                break
-
-        return all_maps_in_layer
-    
-    def train(self, dataloader, num_epochs):
-        # initialize optimizers
-        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr)
-        
-        # get prompt embedding
-        if isinstance(self.prompt, torch.Tensor):
-            print("Using optimized embedding!")
-            text_embedding = self.prompt.clone().detach().to(self.device)
-        else:
-            latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
-            text_embedding = latent_from_prompt.clone().detach().to(self.device)
-        
-        # Save a subset of data for consistent logging
-        log_subset = None
-        log_batch_idx = None
-        
-        current_step = 0
-        for epoch in range(num_epochs):
-            for batch_idx, batch in enumerate(dataloader):
-                N = self.batch_size
-                use_ddim = self.ddim_steps is not None
-                
-                # Get input data
-                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
-                c_cat = c["c_concat"][0][:N]
-                uc_cross = self.model.get_unconditional_conditioning(N)
-                uc_cat = c_cat
-                uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-                
-                # get target attention map from batch
-                gaussian_map = batch['attn_map'].squeeze(0).to(self.device)
-                
-                # Sample generation and attention maps
-                generated, intermediates = self.model.sample_log_with_grad(
-                    cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
-                    batch_size=N, ddim=use_ddim,
-                    ddim_steps=self.ddim_steps,
-                    unconditional_guidance_scale=self.unconditional_guidance_scale,
-                    unconditional_conditioning=uc_full,
-                    control_attentions=True,
-                    gaussian_map=gaussian_map
-                )
-                
-                # Post-process the generated result
-                generated = self.model.decode_first_stage(generated)
-                source_attn_map = intermediates['attn_maps']
-                source_attn_map = self.parse_attn_maps(source_attn_map, self.timestep_to_optimize).to(self.device)
-                target_attn_map = batch['attn_map'].squeeze(0).to(self.device)
-                
-                # Compute loss and backward pass
-                loss = self.mse_loss(source_attn_map, target_attn_map)
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                
-                # Log optimization loss with wandb
-                wandb.log({'attn_guidance/loss': loss.item()}, step=current_step)
-                current_step += 1
-                
-                # Save a subset of data for logging (only once)
-                if log_subset is None:
-                    log_subset = (generated.clone().detach(), target_attn_map.clone().detach(), source_attn_map.clone().detach())
-                    log_batch_idx = batch_idx  # Save the batch index too for consistency
-
-            # Log images at the end of each epoch using the same subset
-            if epoch % 5 == 0:
-                if log_subset is not None:
-                    generated_subset, target_attn_map_subset, source_attn_map_subset = log_subset
-                    self.log_images(generated_subset, target_attn_map_subset, source_attn_map_subset, log_batch_idx, epoch)
-    
-    def log_images(self, generated, target_attn_map, source_attn_map, idx, opt_steps):
-        generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
-        generated = (generated - generated.min()) / (generated.max() - generated.min())
-        generated = (generated * 255).astype(np.uint8)
-
-        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-
-        ax[0].imshow(generated)
-        ax[0].axis('off')
-        ax[0].set_title('Generated Image')
-
-        ax[1].imshow(target_attn_map.cpu().detach().numpy(), cmap='viridis')
-        ax[1].axis('off')
-        ax[1].set_title('Target Attention Map')
-
-        ax[2].imshow(source_attn_map.cpu().detach().numpy(), cmap='viridis')
-        ax[2].axis('off')
-        ax[2].set_title('Source Attention Map')
-
-        plt.savefig(f"{self.logs_dir}/control_batch-{idx}_opt-{opt_steps}.png")

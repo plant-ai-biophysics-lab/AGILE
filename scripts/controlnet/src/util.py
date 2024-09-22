@@ -284,7 +284,7 @@ class PermuteTransform:
         else:
             return np.transpose(x, (0, 1, 2))
     
-def get_attn_maps(attn_maps, num_layers = 4):
+def get_attn_maps(attn_maps, num_layers = 9):
     
     # store attention type into a display grid (columns: timesteps and rows: layers)
     
@@ -293,7 +293,9 @@ def get_attn_maps(attn_maps, num_layers = 4):
     att_types = ['attn2']
     target_size = (512, 512)
     column_titles = []
-    row_titles = ['Layer 3', 'Layer 5', 'Layer 8', 'Layer 11', 'Average']
+    row_titles = ['Layer 3', 'Layer 4', 'Layer 5', 'Layer 6', 
+                  'Layer 7', 'Layer 8', 'Layer 9', 'Layer 10',
+                  'Layer 11', 'Average']
     
     # iterate attn map for each timestep
     for i, attn_map_step in enumerate(attn_maps):

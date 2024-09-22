@@ -7,11 +7,12 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 class ControlNetDataset(Dataset):
-    def __init__(self, source_images_path, target_images_path, prompt, transform=None):
+    def __init__(self, source_images_path, target_images_path, prompt, transform=None, optimizing=False):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
         self.prompt = prompt
         self.transform = transform
+        self.optimizing = optimizing
         
         # Load image file paths
         self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
@@ -102,6 +103,9 @@ class ControlNetDataset(Dataset):
         
         # Normalize attention map between 0 and 1
         attn_map = np.array(attn_map).astype(np.float32) / 255.0
+        
+        if self.optimizing:
+            target_image = source_image
 
         return dict(
             jpg=target_image,

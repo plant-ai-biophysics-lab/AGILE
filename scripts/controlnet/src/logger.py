@@ -9,7 +9,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from src.util import visualize_attention_grid
 
 class ImageLogger(Callback):
-    def __init__(self, epoch_frequency=1, max_images=4, clamp=True, increase_log_steps=True,
+    def __init__(self, epoch_frequency=1, generate_images=False, max_images=4, clamp=True, increase_log_steps=True,
                  rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
                  log_images_kwargs=None):
         super().__init__()
@@ -99,7 +99,7 @@ class ImageLogger(Callback):
         if not self.disabled:
             self.log_img(pl_module, batch, batch_idx, split="train")
 
-    # @rank_zero_only # TODO: Add command line args to enable/disable validation logging
+    # @rank_zero_only
     # def log_final_images(self, pl_module):
     #     if self.train_dataloader is None:
     #         return

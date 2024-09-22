@@ -12,12 +12,14 @@ from torch.utils.data import DataLoader, Subset
 from src.util import create_model, load_state_dict, PermuteTransform, initialize_weights
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
-from src.model import TextEmbeddingOptimizer, AttentionGuidance
+from src.model import TextEmbeddingOptimizer
 from lightning.pytorch.loggers import WandbLogger
 
 def main(args):
     
-    # create model from config and load from chkpt
+    #######################################################
+    ################## MODEL SETUP ########################
+    #######################################################
     mismatch_count = 0
     total_count = 0
     model = create_model(args.model_config).cpu()
@@ -38,12 +40,16 @@ def main(args):
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
-    model.attn_loss_weight = 5.0
+    model.attn_loss_weight = args.attention_loss_weight
     
-    strength = 3.0
+    strength = args.control_strength
     model.control_scales = ([strength] * 13)
     
     print(f"Using parameterization: {model.parameterization}")
+    
+    #######################################################
+    ################## TRAINING SETUP #####################
+    #######################################################
     
     # get optimized prompt embedding if exists
     if args.prompt_embedding is not None:
@@ -60,7 +66,8 @@ def main(args):
         source_images_path=args.source_images_path,
         target_images_path=args.target_images_path,
         prompt=prompt,
-        transform=transform
+        transform=transform,
+        optimizing=args.optimize_embeddings
     )
     dataloader = DataLoader(
         dataset,
@@ -69,10 +76,10 @@ def main(args):
         shuffle=True
     )
     
-    logger = ImageLogger(epoch_frequency=args.logger_freq)
+    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
     logger.train_dataloader = dataloader
     logger.log_images_kwargs = {
-        "control_attentions": True
+        "control_attentions": args.control_attentions
     }
     
     # prepare wandb logger
@@ -96,6 +103,10 @@ def main(args):
     
     # end wandb
     wandb.finish()
+    
+    #######################################################
+    ############### EMBEDDING OPTIMIZATION ################
+    #######################################################
     
     # optimize embeddings
     if args.optimize_embeddings:
@@ -137,30 +148,6 @@ def main(args):
         text_optimizer.train(optimize_dataloader, num_epochs=args.optimize_epochs)
         wandb.finish()
         
-    # if args.control_attentions:
-    #     # Set up the Wandb logger for embedding optimization
-    #     wandb.init(
-    #         entity='paibl',
-    #         project='controlnet',
-    #         name=f"{args.logs_dir.name}_attention_guidance",
-    #         dir=args.logs_dir,
-    #         resume=False
-    #     )
-        
-    #     # Initialize Text Embedding Optimizer
-    #     attention_guidance = AttentionGuidance(
-    #         prompt=prompt,
-    #         model=model,
-    #         batch_size=args.batch_size,
-    #         lr=0.01,
-    #         ddim_steps=50,
-    #         unconditional_guidance_scale=20.0,
-    #         logs_dir=os.path.join(args.logs_dir, "attention_guidance")
-    #     )
-        
-    #     attention_guidance.train(dataloader, num_epochs=args.control_epochs)
-    #     wandb.finish()
-        
 if __name__ == "__main__":
     
     ap = argparse.ArgumentParser()
@@ -190,7 +177,7 @@ if __name__ == "__main__":
                     help="Parameterization for calculation loss: x0, eps, v, or eps_attn")
     ap.add_argument("--optimize_embeddings", action="store_true",
                     help="If set, embeddings will be optimized.")
-    ap.add_argument("--prompt", type=str, default="grape",
+    ap.add_argument("--prompt", type=str, default="None",
                     help="Prompt for text embeddings.")
     ap.add_argument("--optimize_epochs", type=int, default=1,
                     help="Number of epochs for optimizing embeddings.")
@@ -200,10 +187,12 @@ if __name__ == "__main__":
                     help="Path to optimized prompt embedding.")
     ap.add_argument("--control_attentions", action="store_true",
                     help="If set, control attentions will be used.")
-    ap.add_argument("--control_epochs", type=int, default=10,
-                    help="Number of epochs for optimizing control attentions.")
-    # TODO: Add args for strength and unconditional guidance scale
-    # TODO: Add args to generate final images
+    ap.add_argument("--control_strength", type=float, default=1.0,
+                    help="Strength of control.")
+    ap.add_argument("--attention_loss_weight", type=float, default=1.0,
+                    help="Weight for attention loss.")
+    ap.add_argument("--generate_images", action="store_true",
+                    help="If set, final images will be generated at the end.")
     args = ap.parse_args()
     
     main(args)

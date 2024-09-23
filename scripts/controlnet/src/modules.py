@@ -1000,38 +1000,71 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map):
-        
+    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.5, beta2=0.1, target_size=512):
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads = sim_target.shape[0]
         num_tokens = sim_target.shape[2]
 
+        # Reshape sim_target to [num_heads, num_tokens, map_size, map_size]
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
-        gaussian_map = gaussian_map.unsqueeze(0).unsqueeze(0)
-        if gaussian_map.shape[2:] != (map_size, map_size):
+
+        # Normalize Gaussian map to have values between 0 and 1
+        gaussian_map = gaussian_map / gaussian_map.max()
+
+        # Prepare the Gaussian map with a fixed size of 512x512
+        gaussian_map = gaussian_map.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, target_size, target_size]
+        if gaussian_map.shape[2:] != (target_size, target_size):
             gaussian_map = nn.functional.interpolate(
-                gaussian_map, size=(map_size, map_size), mode='bilinear', align_corners=False
+                gaussian_map, size=(target_size, target_size), mode='bilinear', align_corners=False
             )
 
         # Create a mask where the Gaussian map has values greater than 0.3
-        mask = gaussian_map.squeeze(0) > 0.3
-        sim_token_1 = sim_target[:, 1, :, :]
+        mask = gaussian_map > 0.3  # Shape: [1, 1, target_size, target_size]
 
-        # Perform the addition where mask is True
+        # Upsample attention maps to 512x512 if necessary to match the Gaussian map size
+        if map_size != target_size:
+            sim_target = nn.functional.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
+
+        # Handle token 1 separately (index 1)
+        sim_token_1 = sim_target[:, 1, :, :]  # Shape: [num_heads, target_size, target_size]
+
+        # Blend the Gaussian map with sim_token_1 using blending factor beta
         sim_token_1 = torch.where(
-            mask, sim_token_1 + gaussian_map.squeeze(0), sim_token_1
+            mask.squeeze(0),
+            (1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0),
+            sim_token_1
         )
 
+        # Clamp the values between 0 and 1
         sim_token_1 = torch.clamp(sim_token_1, min=0.0, max=1.0)
-        
-        # Create a new copy of sim_target instead of modifying it in-place
-        sim_target_copy = sim_target.clone()
-        sim_target_copy[:, 1, :, :] = sim_token_1
-        
-        # Return the new copy with modifications
-        sim_target_copy = sim_target_copy.permute(0, 2, 3, 1).view(num_heads, -1, num_tokens)
 
-        return sim_target_copy
+        # For tokens 2 and onwards (indices 2 to num_tokens - 1)
+        sim_tokens_rest = sim_target[:, 2:, :, :]  # Shape: [num_heads, num_tokens - 2, target_size, target_size]
+
+        # For tokens 2 and onwards:
+        # - Blend with the Gaussian map where mask is True
+        # - Keep original values where mask is False
+        sim_tokens_rest = torch.where(
+            mask,
+            (1 - beta2) * sim_tokens_rest + beta2 * gaussian_map,
+            sim_tokens_rest
+        )
+
+        # Clamp the values between 0 and 1
+        sim_tokens_rest = torch.clamp(sim_tokens_rest, min=0.0, max=1.0)
+
+        # Update sim_target with modified tokens
+        sim_target[:, 1, :, :] = sim_token_1
+        sim_target[:, 2:, :, :] = sim_tokens_rest
+
+        # Downsample back to original size if necessary
+        if target_size != map_size:
+            sim_target = nn.functional.interpolate(sim_target, size=(map_size, map_size), mode='bilinear', align_corners=False)
+
+        # Reshape back to the original shape [num_heads, map_size * map_size, num_tokens]
+        sim_target = sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
+
+        return sim_target
 
     def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None):
         if self._ATTN_PRECISION == "fp32":

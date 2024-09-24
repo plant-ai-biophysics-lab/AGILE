@@ -6,13 +6,14 @@ import random
 import pytorch_lightning as pl
 
 from pathlib import Path
+from torch import nn
 from torchvision import transforms
 from torch.utils.data import DataLoader, Subset
 
 from src.util import create_model, load_state_dict, PermuteTransform, initialize_weights
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
-from src.model import TextEmbeddingOptimizer
+from src.model import TextEmbeddingOptimizer, AttentionGuidance
 from lightning.pytorch.loggers import WandbLogger
 
 def main(args):
@@ -40,7 +41,6 @@ def main(args):
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
-    model.attn_loss_weight = args.attention_loss_weight
     
     strength = args.control_strength
     model.control_scales = ([strength] * 13)
@@ -76,33 +76,30 @@ def main(args):
         shuffle=True
     )
     
-    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
-    logger.train_dataloader = dataloader
-    logger.log_images_kwargs = {
-        "control_attentions": args.control_attentions
-    }
+    # logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
+    # logger.train_dataloader = dataloader
     
-    # prepare wandb logger
-    wandb_logger = WandbLogger(
-        entity='paibl',
-        project='controlnet',
-        name=f"{args.logs_dir.name}_initial_training",
-        save_dir=args.logs_dir,
-    )
+    # # prepare wandb logger
+    # wandb_logger = WandbLogger(
+    #     entity='paibl',
+    #     project='controlnet',
+    #     name=f"{args.logs_dir.name}_initial_training",
+    #     save_dir=args.logs_dir,
+    # )
     
-    # start training
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        default_root_dir=args.logs_dir,
-        precision = 32,
-        callbacks = [logger],
-        logger=wandb_logger,
-        accumulate_grad_batches=args.batch_size*4,
-    )
-    trainer.fit(model, dataloader)
+    # # start training
+    # trainer = pl.Trainer(
+    #     max_epochs=args.epochs,
+    #     default_root_dir=args.logs_dir,
+    #     precision = 32,
+    #     callbacks = [logger],
+    #     logger=wandb_logger,
+    #     accumulate_grad_batches=args.batch_size*4,
+    # )
+    # trainer.fit(model, dataloader)
     
     # end wandb
-    wandb.finish()
+    # wandb.finish()
     
     #######################################################
     ############### EMBEDDING OPTIMIZATION ################
@@ -148,6 +145,35 @@ def main(args):
         text_optimizer.train(optimize_dataloader, num_epochs=args.optimize_epochs)
         wandb.finish()
         
+    #######################################################
+    ################# ATTENTION GUIDANCE ##################
+    #######################################################
+    
+    if args.control_attentions:
+        
+        # Set up the Wandb logger for embedding optimization
+        wandb.init(
+            entity='paibl',
+            project='controlnet',
+            name=f"{args.logs_dir.name}_attention_guidance",
+            dir=args.logs_dir,
+            resume=False
+        )
+        
+        # Initialize Attention Guidance
+        attention_guidance = AttentionGuidance(
+            prompt=prompt,
+            model=model,
+            batch_size=args.batch_size,
+            lr=0.01,
+            ddim_steps=50,
+            unconditional_guidance_scale=20.0,
+            logs_dir=os.path.join(args.logs_dir, "attention_guidance"),
+            optimization_steps=args.optimize_steps
+        )
+        
+        attention_guidance.train(dataloader, num_epochs=args.optimize_epochs)
+
 if __name__ == "__main__":
     
     ap = argparse.ArgumentParser()
@@ -189,8 +215,6 @@ if __name__ == "__main__":
                     help="If set, control attentions will be used.")
     ap.add_argument("--control_strength", type=float, default=1.0,
                     help="Strength of control.")
-    ap.add_argument("--attention_loss_weight", type=float, default=1.0,
-                    help="Weight for attention loss.")
     ap.add_argument("--generate_images", action="store_true",
                     help="If set, final images will be generated at the end.")
     args = ap.parse_args()

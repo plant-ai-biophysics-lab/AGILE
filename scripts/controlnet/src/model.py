@@ -649,10 +649,8 @@ class DDPM(pl.LightningModule):
         wandb.log({"global_step": self.global_step}, step=self.global_step)
         
         # if batch_idx == 0:  # Visualize the graph for the first batch only to avoid clutter
-        #     graph = make_dot(loss, params=dict(self.named_parameters()))
-        #     graph.render("computation_graph", format="png")
+        #     make_dot(loss, params={"a": self.model.a}).render("attn_graph", format="png")
         
-
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
@@ -1148,8 +1146,9 @@ class LatentDiffusion(DDPM):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         if self.parameterization == "eps_attn":
-            model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True, control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0))
-            # model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0))
+            model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True, 
+                                                       control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0),
+                                                       attn_weights=self.model.a)
         else:
             model_output = self.apply_model(x_noisy, t, cond)
 
@@ -1193,12 +1192,12 @@ class LatentDiffusion(DDPM):
                 self.save_attn(avg_attn, target_attn, all_token_attns, self.save_attn_counter, timestep=int(t), save_dir=self.logger.save_dir)
             
             attn_loss = torch.nn.functional.mse_loss(avg_attn, target_attn)
-            loss = loss + self.attn_loss_weight * attn_loss
+            # loss = loss + self.attn_loss_weight * attn_loss
+            loss = self.attn_loss_weight * attn_loss
 
             loss_dict.update({f'{prefix}/attn_loss': attn_loss})
             loss_dict.update({f'{prefix}/loss_with_attn': loss})
             self.save_attn_counter += 1
-
         return loss, loss_dict
     
     @staticmethod
@@ -1734,6 +1733,9 @@ class ControlLDM(LatentDiffusion):
         # check if gaussian_map is in kwargs else None
         gaussian_map = kwargs.get('gaussian_map', None)
         
+        # check if attention weights are in kwargs else None
+        attn_weights = kwargs.get('attn_weights', None)
+        
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
@@ -1755,7 +1757,7 @@ class ControlLDM(LatentDiffusion):
                     if save_attention:
                         eps, attn_maps_layer = diffusion_model(
                             x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention, 
-                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map
+                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights
                         )
                         return eps, attn_maps_layer
                     else:
@@ -1766,11 +1768,11 @@ class ControlLDM(LatentDiffusion):
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if save_attention:
                     eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
-                                                           control_attentions=control_attentions, gaussian_map=gaussian_map)
+                                                           control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
                     return eps, attn_maps_layer
                 else:
                     eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
-                                          control_attentions=control_attentions, gaussian_map=gaussian_map)
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
                     return eps
 
     @torch.no_grad()
@@ -1901,6 +1903,9 @@ class ControlledUnetModel(UNetModel):
         # check if gaussian_map is in kwargs else None
         gaussian_map = kwargs.get('gaussian_map', None)
         
+        # check if attn_weights is in kwargs else None
+        attn_weights = kwargs.get('attn_weights', None)
+        
         # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -1931,7 +1936,8 @@ class ControlledUnetModel(UNetModel):
             if i in layers_to_save and 'save_attention' in kwargs and kwargs['save_attention']:
                 layer = i
                 if i in layers_to_control:
-                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map)
+                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, 
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
                 else:
                     h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing)
                 attn_maps_layer[layer] = attn_maps
@@ -2386,3 +2392,79 @@ class TextEmbeddingOptimizer:
         ax[2].set_title('Source Attention Map')
 
         plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+        
+class AttentionGuidance:
+    
+    def __init__(
+        self,
+        prompt,
+        model,
+        batch_size,
+        lr,
+        ddim_steps,
+        unconditional_guidance_scale,
+        logs_dir='control_logs',
+        optimization_steps=50,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.model = model.train()
+        self.batch_size = batch_size
+        self.lr = lr
+        self.ddim_steps = ddim_steps
+        self.unconditional_guidance_scale = unconditional_guidance_scale
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.logs_dir = logs_dir
+        self.prompt = prompt
+        self.optimization_steps = optimization_steps
+        
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
+        
+        self.model = self.model.to(self.device)
+        
+        # clear torch cache
+        torch.cuda.empty_cache()
+
+    def train(self, dataloader, num_epochs):
+        
+        # get prompt embedding
+        if isinstance(self.prompt, torch.Tensor):
+            print("Using optimized embedding!")
+            text_embedding = self.prompt.clone().detach().to(self.device)
+        else:
+            latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
+            text_embedding = latent_from_prompt.clone().detach().to(self.device)
+        
+        # Save a subset of data for consistent logging
+        log_subset = None
+        log_batch_idx = None
+        
+        for epoch in range(num_epochs):
+            for batch_idx, batch in enumerate(dataloader):
+                N = self.batch_size
+                use_ddim = self.ddim_steps is not None
+                
+                # Get input data
+                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                c_cat = c["c_concat"][0][:N]
+                uc_cross = self.model.get_unconditional_conditioning(N)
+                uc_cat = c_cat
+                uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
+                
+                # get target attention map from batch
+                gaussian_map = batch['attn_map'].squeeze(0).to(self.device)
+                
+                # Sample generation and attention maps
+                generated, intermediates = self.model.sample_log_with_grad(
+                    cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
+                    batch_size=N, ddim=use_ddim,
+                    ddim_steps=self.ddim_steps,
+                    unconditional_guidance_scale=self.unconditional_guidance_scale,
+                    unconditional_conditioning=uc_full,
+                    control_attentions=True,
+                    gaussian_map=gaussian_map,
+                    optimization_steps=self.optimization_steps,
+                    batch_idx=batch_idx,
+                    logs_dir=self.logs_dir
+                )

@@ -1,6 +1,7 @@
 import torch
 import os
 import math
+import wandb
 import numpy as np
 import torch.nn.functional as F
 import torch.optim as optim
@@ -11,6 +12,7 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
 from transformers import CLIPTokenizer, CLIPTextModel
+import torchvision.utils as vutils
 from torch.utils.checkpoint import checkpoint
     # SamProcessor, SamModel, pipeline
 
@@ -262,17 +264,17 @@ class DDIMSampler(object):
                       dynamic_threshold=None, **kwargs):
         b, *_, device = *x.shape, x.device
         
-        # check if `control_attentions` is True in kwargs
-        if 'control_attentions' in kwargs:
-            control_attentions = kwargs['control_attentions']
-        else:
-            control_attentions = False
+        # # check if `control_attentions` is True in kwargs
+        # if 'control_attentions' in kwargs:
+        #     control_attentions = kwargs['control_attentions']
+        # else:
+        #     control_attentions = False
             
-        # check if gaussian_map is in kwargs
-        if 'gaussian_map' in kwargs:
-            gaussian_map = kwargs['gaussian_map']
-        else:
-            gaussian_map = None
+        # # check if gaussian_map is in kwargs
+        # if 'gaussian_map' in kwargs:
+        #     gaussian_map = kwargs['gaussian_map']
+        # else:
+        #     gaussian_map = None
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             model_output = self.model.apply_model(x, t, c)
@@ -317,8 +319,8 @@ class DDIMSampler(object):
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
             # model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in, save_attention=True).chunk(2) 
-            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True,
-                                                               control_attentions=control_attentions, gaussian_map=gaussian_map)
+            model_uncond_t, attn_maps = self.model.apply_model(x_in, t_in, c_in, save_attention=True)
+                                                            #    control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=self.model.model.a)
             model_uncond, model_t = model_uncond_t.chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 
@@ -1000,85 +1002,63 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.5, beta2=0.1, target_size=512):
+    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.5, beta2=0.1, target_size=512, attn_weights=None):
         map_size = int(math.sqrt(sim_target.shape[1]))
-        num_heads = sim_target.shape[0]
-        num_tokens = sim_target.shape[2]
+        num_heads, num_tokens = sim_target.shape[0], sim_target.shape[2]
 
-        # Reshape sim_target to [num_heads, num_tokens, map_size, map_size]
+        # Reshape sim_target to [num_heads, num_tokens, map_size, map_size] -> [num_heads, map_size, map_size, num_tokens]
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
 
-        # Normalize Gaussian map to have values between 0 and 1
+        # Normalize Gaussian map to have values between 0 and 1, and interpolate if needed
         gaussian_map = gaussian_map / gaussian_map.max()
 
-        # Prepare the Gaussian map with a fixed size of 512x512
-        gaussian_map = gaussian_map.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, target_size, target_size]
-        if gaussian_map.shape[2:] != (target_size, target_size):
-            gaussian_map = nn.functional.interpolate(
-                gaussian_map, size=(target_size, target_size), mode='bilinear', align_corners=False
-            )
+        # Efficient interpolation if needed
+        if gaussian_map.shape[-2:] != (target_size, target_size):
+            gaussian_map = F.interpolate(gaussian_map.unsqueeze(0).unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
+        mask = gaussian_map > 0.3  # Create a mask only once
 
-        # Create a mask where the Gaussian map has values greater than 0.3
-        mask = gaussian_map > 0.3  # Shape: [1, 1, target_size, target_size]
-
-        # Upsample attention maps to 512x512 if necessary to match the Gaussian map size
+        # Only upsample sim_target if necessary
         if map_size != target_size:
-            sim_target = nn.functional.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
+            sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
-        # Handle token 1 separately (index 1)
-        sim_token_1 = sim_target[:, 1, :, :]  # Shape: [num_heads, target_size, target_size]
+        # Separate token 1 and tokens 2 onwards
+        sim_token_1, sim_tokens_rest = sim_target[:, 1, :, :], sim_target[:, 2:, :, :]
 
-        # Blend the Gaussian map with sim_token_1 using blending factor beta
-        sim_token_1 = torch.where(
-            mask.squeeze(0),
-            (1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0),
-            sim_token_1
-        )
+        # Efficient Gaussian blending for token 1
+        sim_token_1 = torch.clamp((1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0), 0.0, 1.0)
 
-        # Clamp the values between 0 and 1
-        sim_token_1 = torch.clamp(sim_token_1, min=0.0, max=1.0)
+        # Efficient Gaussian blending for tokens 2 onwards with broadcasting
+        gaussian_map_exp = gaussian_map.expand_as(sim_tokens_rest)
+        sim_tokens_rest = torch.clamp((1 - beta2) * sim_tokens_rest + beta2 * gaussian_map_exp, 0.0, 1.0)
 
-        # For tokens 2 and onwards (indices 2 to num_tokens - 1)
-        sim_tokens_rest = sim_target[:, 2:, :, :]  # Shape: [num_heads, num_tokens - 2, target_size, target_size]
+        # Apply attention weights across all tokens
+        if attn_weights is not None:
+            sim_tokens_rest = sim_tokens_rest * attn_weights.view(1, -1, 1, 1)
 
-        # For tokens 2 and onwards:
-        # - Blend with the Gaussian map where mask is True
-        # - Keep original values where mask is False
-        sim_tokens_rest = torch.where(
-            mask,
-            (1 - beta2) * sim_tokens_rest + beta2 * gaussian_map,
-            sim_tokens_rest
-        )
-
-        # Clamp the values between 0 and 1
-        sim_tokens_rest = torch.clamp(sim_tokens_rest, min=0.0, max=1.0)
-
-        # Update sim_target with modified tokens
+        # Recombine token 1 and the rest
         sim_target[:, 1, :, :] = sim_token_1
         sim_target[:, 2:, :, :] = sim_tokens_rest
 
-        # Downsample back to original size if necessary
+        # Downsample back to original size only if necessary
         if target_size != map_size:
-            sim_target = nn.functional.interpolate(sim_target, size=(map_size, map_size), mode='bilinear', align_corners=False)
+            sim_target = F.interpolate(sim_target, size=(map_size, map_size), mode='bilinear', align_corners=False)
 
         # Reshape back to the original shape [num_heads, map_size * map_size, num_tokens]
-        sim_target = sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
+        return sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
 
-        return sim_target
-
-    def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None):
+    def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None, attn_weights=None):
         if self._ATTN_PRECISION == "fp32":
             with torch.autocast(enabled=False, device_type='cuda'):
                 q, k = q.float(), k.float()
                 sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
                 sim = sim.softmax(dim=-1)
                 if control_attentions:
-                    sim = self.apply_attention_edit(sim, gaussian_map)
+                    sim = self.apply_attention_edit(sim, gaussian_map, attn_weights=attn_weights)
         else:
             sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
             sim = sim.softmax(dim=-1)
             if control_attentions:
-                sim = self.apply_attention_edit(sim, gaussian_map)
+                sim = self.apply_attention_edit(sim, gaussian_map, attn_weights=attn_weights)
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -1090,7 +1070,7 @@ class CrossAttention(nn.Module):
         
         return out, sim
 
-    def forward(self, x, context=None, mask=None, return_attn_weights=False, optimize=False, control_attentions=False, gaussian_map=None):
+    def forward(self, x, context=None, mask=None, return_attn_weights=False, optimize=False, control_attentions=False, gaussian_map=None, attn_weights=None):
         
         if optimize:
             with torch.enable_grad():
@@ -1101,13 +1081,13 @@ class CrossAttention(nn.Module):
                 v = self.to_v(context)
                 q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-                def checkpointed_attention(q, k, v, control_attentions, gaussian_map):
-                    return self.attention(q, k, v, control_attentions, gaussian_map, mask)
+                def checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights):
+                    return self.attention(q, k, v, control_attentions, gaussian_map, mask, attn_weights)
 
                 if self.use_checkpoint:
-                    out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map), (), self.use_checkpoint)
+                    out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map, attn_weights), (), self.use_checkpoint)
                 else:
-                    out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map)
+                    out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights)
                 
                 out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
                 
@@ -1121,13 +1101,13 @@ class CrossAttention(nn.Module):
             v = self.to_v(context)
             q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-            def checkpointed_attention(q, k, v, control_attentions, gaussian_map):
-                    return self.attention(q, k, v, control_attentions, gaussian_map, mask)
+            def checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights):
+                    return self.attention(q, k, v, control_attentions, gaussian_map, mask, attn_weights)
 
             if self.use_checkpoint:
-                out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map), (), self.use_checkpoint)
+                out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map, attn_weights), (), self.use_checkpoint)
             else:
-                out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map)
+                out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights)
             
             out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
             
@@ -1188,12 +1168,12 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None):
+    def forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, attn_weights=None):
         # return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
         # print('transformer input requires grad:', x.requires_grad, context.requires_grad)
-        return checkpoint(self._forward, x, context, optimize, layer, control_attentions, gaussian_map)
+        return checkpoint(self._forward, x, context, optimize, layer, control_attentions, gaussian_map, attn_weights)
 
-    def _forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None):
+    def _forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, attn_weights=None):
         if optimize:
             with torch.enable_grad() and torch.autograd.graph.save_on_cpu():
                 attn1_output = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False, optimize=optimize)
@@ -1201,7 +1181,8 @@ class BasicTransformerBlock(nn.Module):
                 x = attn1_output + x  # Update x with the output of attn1
 
                 attn2_output, attn2_weights = self.attn2(
-                    self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions, gaussian_map=gaussian_map
+                    self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions, 
+                    gaussian_map=gaussian_map, attn_weights=attn_weights
                 )
                 attn_maps = {'attn2': attn2_weights}
                 x = attn2_output + x  # Update x with the output of attn2
@@ -1213,7 +1194,8 @@ class BasicTransformerBlock(nn.Module):
             # self.attn_maps['attn1'] = attn1_weights  # Store the attention weights
             x = attn1_output + x  # Update x with the output of attn1
 
-            attn2_output, attn2_weights = self.attn2(self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions, gaussian_map=gaussian_map)
+            attn2_output, attn2_weights = self.attn2(self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, 
+                                                     control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
             attn_maps = {'attn2': attn2_weights}
             x = attn2_output + x  # Update x with the output of attn2
 
@@ -1293,6 +1275,12 @@ class SpatialTransformer(nn.Module):
             gaussian_map = kwargs['gaussian_map']
         else:
             gaussian_map = None
+            
+        # check if attn_weights
+        if 'attn_weights' in kwargs:
+            attn_weights = kwargs['attn_weights']
+        else:
+            attn_weights = None
         
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, list):
@@ -1316,7 +1304,8 @@ class SpatialTransformer(nn.Module):
                 context[i] = rearrange(context[i], 'b c h w -> b (h w) c').contiguous()
 
             if layer is not None:
-                x, attn_map = block(x, context=context[i], optimize=optimize, layer=layer, control_attentions=control_attentions, gaussian_map=gaussian_map)
+                x, attn_map = block(x, context=context[i], optimize=optimize, layer=layer, 
+                                    control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
                 attn_maps.append(attn_map)
             else:
                 x = block(x, context=context[i], optimize=optimize, layer=layer)
@@ -1564,6 +1553,43 @@ class DDIMSamplerWithGrad(object):
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
 
+    @staticmethod
+    def parse_attn_maps(attn_maps, target_size=512):
+        all_maps = []
+
+        for _, (_, attn_map) in enumerate(attn_maps.items()):
+            for attn_type, values in attn_map[0].items():
+                if attn_type == 'attn2':
+                    # Directly compute the mean over the batch
+                    a_map = values.mean(dim=0)  # Shape: [256, 77]
+
+                    # Ensure the spatial map size matches the expected 16x16 grid
+                    num_spatial_elements = a_map.shape[0]  # 256 spatial elements
+                    num_tokens = a_map.shape[1]  # 77 tokens
+                    map_size = int(math.sqrt(num_spatial_elements))  # 16x16 spatial size
+
+                    if num_spatial_elements != map_size * map_size:
+                        raise ValueError(f"Cannot reshape {num_spatial_elements} spatial elements into a square grid.")
+
+                    # Reshape and interpolate in one step
+                    a_map = a_map.view(map_size, map_size, num_tokens).permute(2, 0, 1).unsqueeze(0)  # Shape: [1, 77, 16, 16]
+                    
+                    # Interpolate directly
+                    a_map = nn.functional.interpolate(a_map, size=(target_size, target_size), mode='bilinear', align_corners=False)
+
+                    # Squeeze and reorder back to [target_size, target_size, num_tokens]
+                    all_maps.append(a_map.squeeze(0))  # Shape: [77, target_size, target_size]
+
+        # Stack all attention maps and take the mean across layers in one go
+        all_maps_in_layer = torch.stack(all_maps, dim=0).mean(dim=0)  # Shape: [77, target_size, target_size]
+
+        # Normalize in-place to avoid extra memory allocation
+        all_maps_in_layer = (all_maps_in_layer - all_maps_in_layer.min()) / (
+            all_maps_in_layer.max() - all_maps_in_layer.min())
+
+        # Permute back to [target_size, target_size, num_tokens]
+        return all_maps_in_layer.permute(1, 2, 0)  # Shape: [target_size, target_size, num_tokens]
+    
     def sample(self,
                S,
                batch_size,
@@ -1661,43 +1687,142 @@ class DDIMSamplerWithGrad(object):
         print(f"Running DDIM Sampling with {total_steps} timesteps")
 
         iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
-
-        for i, step in enumerate(iterator):
-            index = total_steps - i - 1
+        
+        #### ATTENTION GUIDANCE ####
+        control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
+        if control_attentions:
+            num_tokens = 77
+            a = torch.nn.Parameter(torch.ones(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter)
+            optimizer = torch.optim.Adam([a], lr=0.01)
             
-            # if control_attentions in kwargs is True and index is less than 40, set control_attentions to False
-            if 'control_attentions' in kwargs:
-                if kwargs['control_attentions'] and index < 40:
-                    kwargs['control_attentions'] = False
-                    print('Control attentions set to False')
+            # add a to kwargs
+            kwargs['a_vector'] = a
+            kwargs['optimizing'] = True
+            target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
+            opt_steps = kwargs['optimization_steps']
+            batch_idx = kwargs['batch_idx']
+            trailing_maps_t = None
             
-            ts = torch.full((b,), step, device=device, dtype=torch.long)
+            # Parameters for the grid
+            grid_images = []  # To store images for the grid
+            row_images = []  # Temporarily store row images
+            img_idx = 0  # To track how many images we collect for the grid
+            grid_interval = 10  # Collect every 10th timestep and optimization step
+            current_step = 0
+            
+            collected_timesteps = []  # To store timesteps for column titles
+            collected_opt_steps = []  # To store optimization steps for row titles
+            
+            for opt_step in range(opt_steps):
+                for i, step in enumerate(iterator):
+                    index = total_steps - i - 1
 
-            if mask is not None:
-                assert x0 is not None
-                img_orig = self.model.q_sample(x0, ts)
-                img = img_orig * mask + (1. - mask) * img
+                    if 'control_attentions' in kwargs and kwargs['control_attentions'] and index < 40:
+                        kwargs['control_attentions'] = False
+                        kwargs['optimizing'] = False
+                        print('Control attentions set to False')
 
-            if ucg_schedule is not None:
-                assert len(ucg_schedule) == len(time_range)
-                unconditional_guidance_scale = ucg_schedule[i]
+                    ts = torch.full((b,), step, device=device, dtype=torch.long)
 
-            outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
-                                      quantize_denoised=quantize_denoised, temperature=temperature,
-                                      noise_dropout=noise_dropout, score_corrector=score_corrector,
-                                      corrector_kwargs=corrector_kwargs,
-                                      unconditional_guidance_scale=unconditional_guidance_scale,
-                                      unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold, **kwargs)
-            img, pred_x0, attn_maps = outs
+                    if mask is not None:
+                        assert x0 is not None
+                        img_orig = self.model.q_sample(x0, ts)
+                        img = img_orig * mask + (1. - mask) * img
 
-            if callback: callback(i)
-            if img_callback: img_callback(pred_x0, i)
+                    if ucg_schedule is not None:
+                        assert len(ucg_schedule) == len(time_range)
+                        unconditional_guidance_scale = ucg_schedule[i]
 
-            if index % log_every_t == 0 or index == total_steps - 1:
-                intermediates['x_inter'].append(img)
-                intermediates['pred_x0'].append(pred_x0)
-                intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
+                    outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
+                                            quantize_denoised=quantize_denoised, temperature=temperature,
+                                            noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                            corrector_kwargs=corrector_kwargs,
+                                            unconditional_guidance_scale=unconditional_guidance_scale,
+                                            unconditional_conditioning=unconditional_conditioning,
+                                            dynamic_threshold=dynamic_threshold, **kwargs)
+                    img, pred_x0, attn_maps = outs
+                    
+                    # get average attention maps from all layers
+                    avg_attn_maps = self.parse_attn_maps(attn_maps)
+                    prompt_map = avg_attn_maps[:, :, 1]
+                    
+                    # calculate loss
+                    loss = F.mse_loss(prompt_map, target_map)
+                    loss.backward()
+                    optimizer.step()
+                    wandb.log({'attn_guidance/loss': loss.item()}, step=current_step)
+                    current_step += 1
+                    
+                    # Collect images for the grid every 10 optimization steps and timesteps
+                    if opt_step % grid_interval == 0 and i % grid_interval == 0:
+                        row_images.append(pred_x0)  # Collect current image
+                        if i % grid_interval == 0:
+                            collected_timesteps.append(step)  # Collect the current timestep
+                        
+                    if i % grid_interval == 0 and len(row_images) > 0:
+                        grid_images.append(row_images[:])  # Add row to grid
+                        collected_opt_steps.append(opt_step)  # Collect the current opt step
+                        row_images = []  # Clear row for next set of images
+                    
+                    if callback: callback(i)
+                    if img_callback: img_callback(pred_x0, i)
+                    
+                # reset img
+                if x_T is None:
+                    img = torch.randn(shape, device=device)
+                else:
+                    img = x_T
+                img.requires_grad = True
+                iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+                
+                break # DEBUG
+            
+            # Save the grid to a specified directory
+            rows = len(grid_images)
+            cols = len(grid_images[0]) if grid_images else 0
+            flat_images = [img for row in grid_images for img in row]  # Flatten the grid into a list
+            
+            # Save the grid with the target_map and final image at the top center
+            self.create_image_grid(flat_images, rows, cols, logs_dir, collected_timesteps, collected_opt_steps, batch_idx, target_map=target_map, final_img=img)
+            
+        else:
+            kwargs['optimizing'] = True
+            for i, step in enumerate(iterator):
+                    index = total_steps - i - 1
+                    
+                    # if control_attentions in kwargs is True and index is less than 40, set control_attentions to False
+                    if 'control_attentions' in kwargs:
+                        if kwargs['control_attentions'] and index < 40:
+                            kwargs['control_attentions'] = False
+                            print('Control attentions set to False')
+                    
+                    ts = torch.full((b,), step, device=device, dtype=torch.long)
+
+                    if mask is not None:
+                        assert x0 is not None
+                        img_orig = self.model.q_sample(x0, ts)
+                        img = img_orig * mask + (1. - mask) * img
+
+                    if ucg_schedule is not None:
+                        assert len(ucg_schedule) == len(time_range)
+                        unconditional_guidance_scale = ucg_schedule[i]
+
+                    outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
+                                            quantize_denoised=quantize_denoised, temperature=temperature,
+                                            noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                            corrector_kwargs=corrector_kwargs,
+                                            unconditional_guidance_scale=unconditional_guidance_scale,
+                                            unconditional_conditioning=unconditional_conditioning,
+                                            dynamic_threshold=dynamic_threshold, **kwargs)
+                    img, pred_x0, attn_maps = outs
+
+                    if callback: callback(i)
+                    if img_callback: img_callback(pred_x0, i)
+
+                    if index % log_every_t == 0 or index == total_steps - 1:
+                        intermediates['x_inter'].append(img)
+                        intermediates['pred_x0'].append(pred_x0)
+                        intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
 
         return img, intermediates
 
@@ -1718,11 +1843,21 @@ class DDIMSamplerWithGrad(object):
             gaussian_map = kwargs['gaussian_map']
         else:
             gaussian_map = None
+            
+        if 'a_vector' in kwargs:
+            a_vector = kwargs['a_vector']
+        else:
+            a_vector = None
+            
+        if 'optimizing' in kwargs:
+            optimizing = kwargs['optimizing']
+        else:
+            optimizing = False
 
-        def forward_model(x_in, t_in, c_in, control_attentions):
+        def forward_model(x_in, t_in, c_in):
             if control_attentions:
-                return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=True, control_attentions=True, gaussian_map=gaussian_map)
-            return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=True)
+                return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=True, control_attentions=True, gaussian_map=gaussian_map, attn_weights=a_vector)
+            return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=optimizing)
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             # Use checkpointing on the forward model
@@ -1766,9 +1901,9 @@ class DDIMSamplerWithGrad(object):
             # Use checkpointing for concatenated tensors
             if use_checkpoint:
                 # print('input gradients:', x_in.requires_grad, t_in.requires_grad, c_in['c_crossattn'][0].requires_grad)
-                model_uncond_t, attn_maps = checkpoint(forward_model, x_in, t_in, c_in, control_attentions)
+                model_uncond_t, attn_maps = checkpoint(forward_model, x_in, t_in, c_in)
             else:
-                model_uncond_t, attn_maps = forward_model(x_in, t_in, c_in, control_attentions)
+                model_uncond_t, attn_maps = forward_model(x_in, t_in, c_in)
             
             model_uncond, model_t = model_uncond_t.chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
@@ -1812,3 +1947,40 @@ class DDIMSamplerWithGrad(object):
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
 
         return x_prev, pred_x0, attn_maps
+    
+    def create_image_grid(images, rows, cols, logs_dir, timesteps, opt_steps, batch_idx, target_map=None, final_img=None):
+
+        # Convert target_map and final_img to a consistent format if they are provided
+        if target_map is not None and final_img is not None:
+            # Add a row at the top with target_map and final_img in the center
+            placeholder_img = torch.zeros_like(target_map)  # Create placeholders for padding the sides
+            top_row = [placeholder_img] * ((cols - 2) // 2) + [target_map, final_img] + [placeholder_img] * ((cols - 2) // 2)
+            images = top_row + images  # Prepend the top row to the list of images
+            rows += 1  # Account for the additional row
+
+        # Stack the images into a single tensor
+        grid_img = vutils.make_grid(torch.stack(images), nrow=cols, padding=2, normalize=True)
+
+        # Create the logs directory if it doesn't exist
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+
+        # Create the plot for the grid
+        plt.figure(figsize=(20, 10))
+        plt.imshow(grid_img.permute(1, 2, 0).cpu())  # Change dimensions for matplotlib
+        plt.axis('off')
+
+        # Add column titles (timesteps) and row titles (opt_steps)
+        for col in range(cols):
+            plt.text(col * grid_img.shape[2] // cols + grid_img.shape[2] // (2 * cols),
+                    -10, f'Timestep {timesteps[col]}', ha='center', va='bottom', fontsize=10, color='black')
+
+        for row in range(1, rows):  # Start from 1 to account for the target/final row
+            plt.text(-20, row * grid_img.shape[1] // rows + grid_img.shape[1] // (2 * rows),
+                    f'Opt Step {opt_steps[row - 1]}', ha='right', va='center', fontsize=10, color='black')
+
+        # Save the grid image with row and column titles
+        save_path = os.path.join(logs_dir, f"batch_idx_{batch_idx}.png")
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Grid image with titles saved to {save_path}")

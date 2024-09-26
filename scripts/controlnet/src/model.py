@@ -2436,10 +2436,6 @@ class AttentionGuidance:
             latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
             text_embedding = latent_from_prompt.clone().detach().to(self.device)
         
-        # Save a subset of data for consistent logging
-        log_subset = None
-        log_batch_idx = None
-        
         for epoch in range(num_epochs):
             for batch_idx, batch in enumerate(dataloader):
                 N = self.batch_size
@@ -2466,5 +2462,6 @@ class AttentionGuidance:
                     gaussian_map=gaussian_map,
                     optimization_steps=self.optimization_steps,
                     batch_idx=batch_idx,
-                    logs_dir=self.logs_dir
+                    logs_dir=self.logs_dir,
+                    source_img=batch['hint'],
                 )

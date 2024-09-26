@@ -98,7 +98,7 @@ def main(args):
     # )
     # trainer.fit(model, dataloader)
     
-    # end wandb
+    # # end wandb
     # wandb.finish()
     
     #######################################################
@@ -165,7 +165,7 @@ def main(args):
             prompt=prompt,
             model=model,
             batch_size=args.batch_size,
-            lr=0.01,
+            lr=0.1,
             ddim_steps=50,
             unconditional_guidance_scale=20.0,
             logs_dir=os.path.join(args.logs_dir, "attention_guidance"),

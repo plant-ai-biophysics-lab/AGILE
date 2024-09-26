@@ -4,7 +4,9 @@ import math
 import wandb
 import numpy as np
 import torch.nn.functional as F
-import torch.optim as optim
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 from PIL import Image
 from tqdm import tqdm
@@ -12,7 +14,6 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
 from transformers import CLIPTokenizer, CLIPTextModel
-import torchvision.utils as vutils
 from torch.utils.checkpoint import checkpoint
     # SamProcessor, SamModel, pipeline
 
@@ -1002,20 +1003,19 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.5, beta2=0.1, target_size=512, attn_weights=None):
+    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.7, beta2=0.1, target_size=512, attn_weights=None):
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads, num_tokens = sim_target.shape[0], sim_target.shape[2]
 
         # Reshape sim_target to [num_heads, num_tokens, map_size, map_size] -> [num_heads, map_size, map_size, num_tokens]
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
 
-        # Normalize Gaussian map to have values between 0 and 1, and interpolate if needed
-        gaussian_map = gaussian_map / gaussian_map.max()
+        # # Normalize Gaussian map to have values between 0 and 1, and interpolate if needed
+        # gaussian_map = gaussian_map / gaussian_map.max()
 
-        # Efficient interpolation if needed
-        if gaussian_map.shape[-2:] != (target_size, target_size):
-            gaussian_map = F.interpolate(gaussian_map.unsqueeze(0).unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
-        mask = gaussian_map > 0.3  # Create a mask only once
+        # # Efficient interpolation if needed
+        # if gaussian_map.shape[-2:] != (target_size, target_size):
+        #     gaussian_map = F.interpolate(gaussian_map.unsqueeze(0).unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
 
         # Only upsample sim_target if necessary
         if map_size != target_size:
@@ -1026,10 +1026,12 @@ class CrossAttention(nn.Module):
 
         # Efficient Gaussian blending for token 1
         sim_token_1 = torch.clamp((1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0), 0.0, 1.0)
+        # sim_token_1 = torch.clamp((sim_token_1 + gaussian_map.squeeze(0)), 0.0, 1.0)
 
         # Efficient Gaussian blending for tokens 2 onwards with broadcasting
         gaussian_map_exp = gaussian_map.expand_as(sim_tokens_rest)
         sim_tokens_rest = torch.clamp((1 - beta2) * sim_tokens_rest + beta2 * gaussian_map_exp, 0.0, 1.0)
+        # sim_tokens_rest = torch.clamp((sim_tokens_rest + gaussian_map_exp), 0.0, 1.0)
 
         # Apply attention weights across all tokens
         if attn_weights is not None:
@@ -1692,26 +1694,27 @@ class DDIMSamplerWithGrad(object):
         control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
         if control_attentions:
             num_tokens = 77
-            a = torch.nn.Parameter(torch.ones(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter)
+            # a = torch.nn.Parameter(torch.ones(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter)
+            # a = torch.nn.Parameter(torch.rand(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter) with random values between 0 and 1
+            a = torch.nn.Parameter(torch.full((num_tokens - 2,), 0.5).to('cuda'))  # Create as a leaf tensor (Parameter)
             optimizer = torch.optim.Adam([a], lr=0.01)
             
-            # add a to kwargs
+            # Add a to kwargs
             kwargs['a_vector'] = a
             kwargs['optimizing'] = True
             target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
             opt_steps = kwargs['optimization_steps']
             batch_idx = kwargs['batch_idx']
-            trailing_maps_t = None
+            logs_dir = kwargs['logs_dir']
+            source_img = kwargs['source_img']
             
-            # Parameters for the grid
-            grid_images = []  # To store images for the grid
-            row_images = []  # Temporarily store row images
-            img_idx = 0  # To track how many images we collect for the grid
-            grid_interval = 10  # Collect every 10th timestep and optimization step
-            current_step = 0
+            # Prefill the grid for normal images and prompt maps
+            num_timesteps_to_display = 6  # For Timestep 50, 40, 30, 20, 10, 0
+            grid_images = [[None for _ in range(num_timesteps_to_display + 1)] for _ in range(opt_steps)]  # +1 for source_img
+            prompt_map_grid = [[None for _ in range(num_timesteps_to_display + 1)] for _ in range(opt_steps)]  # +1 for target_map
             
-            collected_timesteps = []  # To store timesteps for column titles
-            collected_opt_steps = []  # To store optimization steps for row titles
+            # Timesteps to display (every 10th step, starting from 50)
+            timesteps_to_display = [49, 40, 30, 20, 10, 0]
             
             for opt_step in range(opt_steps):
                 for i, step in enumerate(iterator):
@@ -1720,7 +1723,7 @@ class DDIMSamplerWithGrad(object):
                     if 'control_attentions' in kwargs and kwargs['control_attentions'] and index < 40:
                         kwargs['control_attentions'] = False
                         kwargs['optimizing'] = False
-                        print('Control attentions set to False')
+                        print('Setting control attentions and optimizing to False')
 
                     ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -1742,48 +1745,61 @@ class DDIMSamplerWithGrad(object):
                                             dynamic_threshold=dynamic_threshold, **kwargs)
                     img, pred_x0, attn_maps = outs
                     
-                    # get average attention maps from all layers
-                    avg_attn_maps = self.parse_attn_maps(attn_maps)
-                    prompt_map = avg_attn_maps[:, :, 1]
-                    
-                    # calculate loss
-                    loss = F.mse_loss(prompt_map, target_map)
-                    loss.backward()
-                    optimizer.step()
-                    wandb.log({'attn_guidance/loss': loss.item()}, step=current_step)
-                    current_step += 1
-                    
-                    # Collect images for the grid every 10 optimization steps and timesteps
-                    if opt_step % grid_interval == 0 and i % grid_interval == 0:
-                        row_images.append(pred_x0)  # Collect current image
-                        if i % grid_interval == 0:
-                            collected_timesteps.append(step)  # Collect the current timestep
+                    if kwargs['optimizing']:
+                        # get average attention maps from all layers
+                        avg_attn_maps = self.parse_attn_maps(attn_maps)
+                        prompt_map = avg_attn_maps[:, :, 1]
+                        trailing_maps = avg_attn_maps[:, :, 2:]
                         
-                    if i % grid_interval == 0 and len(row_images) > 0:
-                        grid_images.append(row_images[:])  # Add row to grid
-                        collected_opt_steps.append(opt_step)  # Collect the current opt step
-                        row_images = []  # Clear row for next set of images
+                        # multiply trailing maps with prompt map
+                        trailing_maps = trailing_maps * prompt_map.unsqueeze(-1)
+                        
+                        # calculate loss
+                        loss = F.mse_loss(prompt_map, target_map)
+                        loss.backward()
+                        optimizer.step()
+                        wandb.log({'attn_guidance/loss': loss.item()})
+                        # check if a has grad
+                        if a.grad is None:
+                            print('a has no grad')
                     
-                    if callback: callback(i)
-                    if img_callback: img_callback(pred_x0, i)
+                    # Check if `index` is in `timesteps_to_display`
+                    if index in timesteps_to_display:
+                        timestep_index = timesteps_to_display.index(index)
+                        img_decoded = self.model.decode_first_stage(img)
+                        grid_images[opt_step][timestep_index] = img_decoded  # Store in prefilled grid for selected timesteps
+                        
+                        # Save the corresponding `prompt_map` in the prompt_map_grid
+                        prompt_map_colored = self.apply_viridis_colormap(prompt_map)
+                        prompt_map_grid[opt_step][timestep_index] = prompt_map_colored
                     
-                # reset img
+                # Add source_img and target_map at the end of each row
+                grid_images[opt_step][-1] = source_img.squeeze(0).permute(2, 0, 1)  # Add source image at the end of the row in the normal grid
+                prompt_map_colored_target = self.apply_viridis_colormap(target_map)
+                prompt_map_grid[opt_step][-1] = prompt_map_colored_target  # Add target map at the end of the row in the prompt map grid
+                
+                # Reset img
                 if x_T is None:
                     img = torch.randn(shape, device=device)
                 else:
                     img = x_T
                 img.requires_grad = True
+                kwargs['optimizing'] = True
+                kwargs['control_attentions'] = True
+                print(f'Optimization step {opt_step} completed')
+                print('Setting control attentions and optimizing back to True')
                 iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
-                
-                break # DEBUG
+
+            # Generate the image grid from the prefilled array for both normal images and prompt maps
+            opt_step_titles = [f'Step {i + 1}' for i in range(opt_steps)]  # Row titles
             
-            # Save the grid to a specified directory
-            rows = len(grid_images)
-            cols = len(grid_images[0]) if grid_images else 0
-            flat_images = [img for row in grid_images for img in row]  # Flatten the grid into a list
+             # Save normal image grid
+            rgb_img_dir = os.path.join(logs_dir, 'rgb_images')
+            self.create_image_grid_prefilled(grid_images, opt_steps, num_timesteps_to_display + 1, rgb_img_dir, timesteps_to_display + ["Source"], opt_step_titles, batch_idx=batch_idx, target_map=target_map, final_img=None)
             
-            # Save the grid with the target_map and final image at the top center
-            self.create_image_grid(flat_images, rows, cols, logs_dir, collected_timesteps, collected_opt_steps, batch_idx, target_map=target_map, final_img=img)
+            # Save prompt map grid
+            attn_map_dir = os.path.join(logs_dir, 'attn_maps')
+            self.create_image_grid_prefilled(prompt_map_grid, opt_steps, num_timesteps_to_display + 1, attn_map_dir, timesteps_to_display + ["Target"], opt_step_titles, batch_idx=batch_idx, target_map=target_map, final_img=None)
             
         else:
             kwargs['optimizing'] = True
@@ -1948,18 +1964,44 @@ class DDIMSamplerWithGrad(object):
 
         return x_prev, pred_x0, attn_maps
     
-    def create_image_grid(images, rows, cols, logs_dir, timesteps, opt_steps, batch_idx, target_map=None, final_img=None):
+    @staticmethod
+    def apply_viridis_colormap(attn_map):
+        """Apply the VIRIDIS colormap to a 2D attention map."""
+        
+        # Clone the tensor if you need to preserve the computation graph
+        attn_map_for_colormap = attn_map.clone().detach().cpu().squeeze()  # Detach and move to CPU for NumPy
+        
+        attn_map_np = attn_map_for_colormap.numpy()  # Convert to NumPy array
+        viridis = cm.get_cmap('viridis')
+        attn_map_colored = viridis(attn_map_np)[:, :, :3]  # Apply colormap and drop alpha channel
+        attn_map_colored = torch.tensor(attn_map_colored).permute(2, 0, 1)  # Ensure it's in [3, H, W] format
+        
+        return attn_map_colored
+        
+    @staticmethod
+    def create_image_grid_prefilled(images_grid, rows, cols, logs_dir, timesteps, opt_steps, batch_idx, target_map=None, final_img=None):
 
-        # Convert target_map and final_img to a consistent format if they are provided
-        if target_map is not None and final_img is not None:
-            # Add a row at the top with target_map and final_img in the center
-            placeholder_img = torch.zeros_like(target_map)  # Create placeholders for padding the sides
-            top_row = [placeholder_img] * ((cols - 2) // 2) + [target_map, final_img] + [placeholder_img] * ((cols - 2) // 2)
-            images = top_row + images  # Prepend the top row to the list of images
-            rows += 1  # Account for the additional row
+        # Determine the device (if all tensors should be on the same GPU or CPU)
+        device = images_grid[0][0].device if images_grid[0][0] is not None else 'cpu'
+
+        # Create a flat list of images from the prefilled grid for stacking
+        processed_images = []
+        for row in images_grid:
+            for img in row:
+                if img is not None:
+                    img = img.to(device)
+                    # Remove batch dimension if present
+                    if img.dim() == 4 and img.shape[0] == 1:  
+                        img = img.squeeze(0)  # Now img is [3, 512, 512] or [1, 512, 512]
+                    # If the image is grayscale (1 channel), convert it to 3 channels
+                    if img.shape[0] == 1:  
+                        img = img.repeat(3, 1, 1)  # Convert grayscale to RGB
+                    processed_images.append(img)
+                else:
+                    processed_images.append(torch.zeros(3, 512, 512).to(device))  # Placeholder for missing images
 
         # Stack the images into a single tensor
-        grid_img = vutils.make_grid(torch.stack(images), nrow=cols, padding=2, normalize=True)
+        grid_img = vutils.make_grid(torch.stack(processed_images), nrow=cols, padding=2, normalize=True)
 
         # Create the logs directory if it doesn't exist
         if not os.path.exists(logs_dir):
@@ -1967,7 +2009,7 @@ class DDIMSamplerWithGrad(object):
 
         # Create the plot for the grid
         plt.figure(figsize=(20, 10))
-        plt.imshow(grid_img.permute(1, 2, 0).cpu())  # Change dimensions for matplotlib
+        plt.imshow(grid_img.permute(1, 2, 0).cpu())  # Move to CPU for displaying and change dimensions for matplotlib
         plt.axis('off')
 
         # Add column titles (timesteps) and row titles (opt_steps)
@@ -1975,9 +2017,9 @@ class DDIMSamplerWithGrad(object):
             plt.text(col * grid_img.shape[2] // cols + grid_img.shape[2] // (2 * cols),
                     -10, f'Timestep {timesteps[col]}', ha='center', va='bottom', fontsize=10, color='black')
 
-        for row in range(1, rows):  # Start from 1 to account for the target/final row
+        for row in range(rows):
             plt.text(-20, row * grid_img.shape[1] // rows + grid_img.shape[1] // (2 * rows),
-                    f'Opt Step {opt_steps[row - 1]}', ha='right', va='center', fontsize=10, color='black')
+                    f'Opt Step {opt_steps[row]}', ha='right', va='center', fontsize=10, color='black')
 
         # Save the grid image with row and column titles
         save_path = os.path.join(logs_dir, f"batch_idx_{batch_idx}.png")

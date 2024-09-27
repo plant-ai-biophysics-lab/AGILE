@@ -40,28 +40,48 @@ class ControlNetDataset(Dataset):
             self.target_image_files += random.choices(self.target_image_files, k=deficit)
     
     @staticmethod
-    def gaussian_map(image, yolo_file, sigma=20.0):
-        
+    def gaussian_map(image, yolo_file, sigma_scale=0.1):
         # Create an empty attention map
         attention_map = np.zeros(image.shape[:2])
         
-        # Create a grid of coordinates
-        x_coords = np.arange(image.shape[1])
-        y_coords = np.arange(image.shape[0])
-        x_grid, y_grid = np.meshgrid(x_coords, y_coords)
-        
-        # Get center points
+        # Get bounding box coordinates
         with open(yolo_file, 'r') as f:
             label = f.readlines()
-        center_points = []
+        
         for line in label:
-            _, x_center, y_center, _, _ = map(float, line.split())
-            center_points.append((x_center * image.shape[1], y_center * image.shape[0]))
+            _, x_center, y_center, width, height = map(float, line.split())
             
-        # Generate attention map
-        for x, y in center_points:
-            dist_squared = (x_grid - x) ** 2 + (y_grid - y) ** 2
-            attention_map += np.exp(-dist_squared / (2 * sigma ** 2))
+            # Convert to image coordinates
+            x_min = int((x_center - width / 2) * image.shape[1])
+            y_min = int((y_center - height / 2) * image.shape[0])
+            x_max = int((x_center + width / 2) * image.shape[1])
+            y_max = int((y_center + height / 2) * image.shape[0])
+            
+            # Make sure the bounding box is within image bounds
+            x_min = max(0, x_min)
+            y_min = max(0, y_min)
+            x_max = min(image.shape[1] - 1, x_max)
+            y_max = min(image.shape[0] - 1, y_max)
+            
+            # Calculate the bounding box size
+            box_width = x_max - x_min
+            box_height = y_max - y_min
+            
+            # Scale sigma based on the bounding box size
+            sigma = sigma_scale * max(box_width, box_height)
+            
+            # Create a grid of coordinates within the bounding box
+            x_coords = np.arange(x_min, x_max + 1)
+            y_coords = np.arange(y_min, y_max + 1)
+            x_grid, y_grid = np.meshgrid(x_coords, y_coords)
+            
+            # Calculate distances from the center
+            x_center_image = x_center * image.shape[1]
+            y_center_image = y_center * image.shape[0]
+            dist_squared = (x_grid - x_center_image) ** 2 + (y_grid - y_center_image) ** 2
+            
+            # Apply Gaussian to the bounding box region
+            attention_map[y_min:y_max + 1, x_min:x_max + 1] += np.exp(-dist_squared / (2 * sigma ** 2))
             
         attention_map /= np.max(attention_map)
         

@@ -1003,19 +1003,12 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.7, beta2=0.1, target_size=512, attn_weights=None):
+    def apply_attention_edit(self, sim_target, gaussian_map, beta1=0.7, beta2=0.2, target_size=512, attn_weights=None):
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads, num_tokens = sim_target.shape[0], sim_target.shape[2]
 
         # Reshape sim_target to [num_heads, num_tokens, map_size, map_size] -> [num_heads, map_size, map_size, num_tokens]
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
-
-        # # Normalize Gaussian map to have values between 0 and 1, and interpolate if needed
-        # gaussian_map = gaussian_map / gaussian_map.max()
-
-        # # Efficient interpolation if needed
-        # if gaussian_map.shape[-2:] != (target_size, target_size):
-        #     gaussian_map = F.interpolate(gaussian_map.unsqueeze(0).unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
 
         # Only upsample sim_target if necessary
         if map_size != target_size:
@@ -1026,12 +1019,10 @@ class CrossAttention(nn.Module):
 
         # Efficient Gaussian blending for token 1
         sim_token_1 = torch.clamp((1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0), 0.0, 1.0)
-        # sim_token_1 = torch.clamp((sim_token_1 + gaussian_map.squeeze(0)), 0.0, 1.0)
 
         # Efficient Gaussian blending for tokens 2 onwards with broadcasting
         gaussian_map_exp = gaussian_map.expand_as(sim_tokens_rest)
         sim_tokens_rest = torch.clamp((1 - beta2) * sim_tokens_rest + beta2 * gaussian_map_exp, 0.0, 1.0)
-        # sim_tokens_rest = torch.clamp((sim_tokens_rest + gaussian_map_exp), 0.0, 1.0)
 
         # Apply attention weights across all tokens
         if attn_weights is not None:
@@ -1749,10 +1740,10 @@ class DDIMSamplerWithGrad(object):
                         # get average attention maps from all layers
                         avg_attn_maps = self.parse_attn_maps(attn_maps)
                         prompt_map = avg_attn_maps[:, :, 1]
-                        trailing_maps = avg_attn_maps[:, :, 2:]
+                        # trailing_maps = avg_attn_maps[:, :, 2:]
                         
-                        # multiply trailing maps with prompt map
-                        trailing_maps = trailing_maps * prompt_map.unsqueeze(-1)
+                        # # multiply trailing maps with prompt map
+                        # trailing_maps = trailing_maps * prompt_map.unsqueeze(-1)
                         
                         # calculate loss
                         loss = F.mse_loss(prompt_map, target_map)

@@ -151,6 +151,16 @@ def main(args):
     
     if args.control_attentions:
         
+        # TODO: REMOVE THIS DEBUG AFTER DRAFT RUNS
+        # reduce dataset size to 5 for debugging
+        dataset = Subset(dataset, random.sample(range(len(dataset)), 5))
+        dataloader_debug = DataLoader(
+            dataset,
+            num_workers=0,
+            batch_size=args.batch_size,
+            shuffle=True
+        )
+        
         # Set up the Wandb logger for embedding optimization
         wandb.init(
             entity='paibl',
@@ -172,7 +182,7 @@ def main(args):
             optimization_steps=args.optimize_steps
         )
         
-        attention_guidance.train(dataloader, num_epochs=args.optimize_epochs)
+        attention_guidance.train(dataloader_debug, num_epochs=args.optimize_epochs)
 
 if __name__ == "__main__":
     

@@ -76,30 +76,30 @@ def main(args):
         shuffle=True
     )
     
-    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
-    logger.train_dataloader = dataloader
+    # logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
+    # logger.train_dataloader = dataloader
     
-    # prepare wandb logger
-    wandb_logger = WandbLogger(
-        entity='paibl',
-        project='controlnet',
-        name=f"{args.logs_dir.name}_initial_training",
-        save_dir=args.logs_dir,
-    )
+    # # prepare wandb logger
+    # wandb_logger = WandbLogger(
+    #     entity='paibl',
+    #     project='controlnet',
+    #     name=f"{args.logs_dir.name}_initial_training",
+    #     save_dir=args.logs_dir,
+    # )
     
-    # start training
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        default_root_dir=args.logs_dir,
-        precision = 32,
-        callbacks = [logger],
-        logger=wandb_logger,
-        accumulate_grad_batches=args.batch_size*4,
-    )
-    trainer.fit(model, dataloader)
+    # # start training
+    # trainer = pl.Trainer(
+    #     max_epochs=args.epochs,
+    #     default_root_dir=args.logs_dir,
+    #     precision = 32,
+    #     callbacks = [logger],
+    #     logger=wandb_logger,
+    #     accumulate_grad_batches=args.batch_size*4,
+    # )
+    # trainer.fit(model, dataloader)
     
-    # end wandb
-    wandb.finish()
+    # # end wandb
+    # wandb.finish()
     
     #######################################################
     ############### EMBEDDING OPTIMIZATION ################
@@ -175,7 +175,7 @@ def main(args):
             prompt=prompt,
             model=model,
             batch_size=args.batch_size,
-            lr=0.1,
+            lr=1.0,
             ddim_steps=50,
             unconditional_guidance_scale=20.0,
             logs_dir=os.path.join(args.logs_dir, "attention_guidance"),

@@ -1736,6 +1736,10 @@ class ControlLDM(LatentDiffusion):
         # check if attention weights are in kwargs else None
         attn_weights = kwargs.get('attn_weights', None)
         
+        # get beta values
+        beta1 = kwargs.get('beta1', 1.0)
+        beta2 = kwargs.get('beta2', 0.1)
+        
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
@@ -1757,7 +1761,7 @@ class ControlLDM(LatentDiffusion):
                     if save_attention:
                         eps, attn_maps_layer = diffusion_model(
                             x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention, 
-                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights
+                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
                         )
                         return eps, attn_maps_layer
                     else:
@@ -1768,11 +1772,11 @@ class ControlLDM(LatentDiffusion):
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if save_attention:
                     eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
-                                                           control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
+                                                           control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
                     return eps, attn_maps_layer
                 else:
                     eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
-                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
                     return eps
 
     @torch.no_grad()
@@ -1906,6 +1910,10 @@ class ControlledUnetModel(UNetModel):
         # check if attn_weights is in kwargs else None
         attn_weights = kwargs.get('attn_weights', None)
         
+        # get betas
+        beta1 = kwargs.get('beta1', 1.0)
+        beta2 = kwargs.get('beta2', 0.1)
+        
         # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -1937,7 +1945,7 @@ class ControlledUnetModel(UNetModel):
                 layer = i
                 if i in layers_to_control:
                     h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, 
-                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
                 else:
                     h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing)
                 attn_maps_layer[layer] = attn_maps
@@ -2265,7 +2273,7 @@ class TextEmbeddingOptimizer:
             (timestep, attn_map_layers), = attn_map_step.items()
             if timestep == timestep_to_optimize:
                 all_maps_in_layer = []
-                attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
+                # attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
                 for _, (_, attn_map) in enumerate(attn_map_layers.items()):
                     for attn_type, values in attn_map[0].items():
                         if attn_type == self.att_type:
@@ -2464,4 +2472,5 @@ class AttentionGuidance:
                     batch_idx=batch_idx,
                     logs_dir=self.logs_dir,
                     source_img=batch['hint'],
+                    lr=self.lr
                 )

@@ -38,9 +38,9 @@ class ControlNetDataset(Dataset):
         elif len(self.target_image_files) < len(self.source_image_files):
             deficit = len(self.source_image_files) - len(self.target_image_files)
             self.target_image_files += random.choices(self.target_image_files, k=deficit)
-    
+   
     @staticmethod
-    def gaussian_map(image, yolo_file, sigma_scale=0.1):
+    def gaussian_map(image, yolo_file):
         # Create an empty attention map
         attention_map = np.zeros(image.shape[:2])
         
@@ -67,27 +67,44 @@ class ControlNetDataset(Dataset):
             box_width = x_max - x_min
             box_height = y_max - y_min
             
-            # Scale sigma based on the bounding box size
-            sigma = sigma_scale * max(box_width, box_height)
+            # Set sigma to ensure the Gaussian falls to near-zero at the edges
+            sigma_x = box_width / 4.0
+            sigma_y = box_height / 4.0
             
             # Create a grid of coordinates within the bounding box
-            x_coords = np.arange(x_min, x_max + 1)
-            y_coords = np.arange(y_min, y_max + 1)
+            x_coords = np.linspace(x_min, x_max, box_width)
+            y_coords = np.linspace(y_min, y_max, box_height)
             x_grid, y_grid = np.meshgrid(x_coords, y_coords)
             
-            # Calculate distances from the center
+            # Calculate distances from the center of the bounding box
             x_center_image = x_center * image.shape[1]
             y_center_image = y_center * image.shape[0]
-            dist_squared = (x_grid - x_center_image) ** 2 + (y_grid - y_center_image) ** 2
+            dist_squared_x = ((x_grid - x_center_image) / sigma_x) ** 2
+            dist_squared_y = ((y_grid - y_center_image) / sigma_y) ** 2
+            dist_squared = dist_squared_x + dist_squared_y
             
-            # Apply Gaussian to the bounding box region
-            attention_map[y_min:y_max + 1, x_min:x_max + 1] += np.exp(-dist_squared / (2 * sigma ** 2))
+            # Apply Gaussian to create a peak of 1 at the center, falling to zero at the edges
+            gaussian_map = np.exp(-dist_squared / 2)
+            gaussian_map = np.clip(gaussian_map, 0, 1)  # Ensure values are within [0, 1]
             
-        attention_map /= np.max(attention_map)
+            # Place the Gaussian in the attention map
+            attention_map[y_min:y_max, x_min:x_max] = np.maximum(attention_map[y_min:y_max, x_min:x_max], gaussian_map)
         
-        # Change to PIL image
+        # Normalize the entire attention map (if needed)
+        if np.max(attention_map) > 0:
+            attention_map /= np.max(attention_map)
+        
+        # Convert to PIL image
         attention_map = Image.fromarray((attention_map * 255).astype(np.uint8))
-            
+        
+        # # Save the VIRIDIS colormap version for debugging
+        # import matplotlib.pyplot as plt
+        # import matplotlib.cm as cm
+        # plt.imshow(attention_map, cmap=cm.viridis)
+        # plt.axis('off')  # Hide axes
+        # plt.savefig("attention_map_viridis_debug.png", bbox_inches='tight', pad_inches=0)
+        # plt.close()
+        
         return attention_map
     
     def __len__(self):

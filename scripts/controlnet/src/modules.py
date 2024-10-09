@@ -1022,18 +1022,25 @@ class CrossAttention(nn.Module):
         sim_token_1, sim_tokens_rest = sim_target[:, 1, :, :], sim_target[:, 2:, :, :]
 
         # Efficient Gaussian blending for token 1
-        sim_1_mean = sim_token_1.mean()
-        sim_1_std = sim_token_1.std()
-        gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
-        gaussian_map = gaussian_map * sim_1_std + sim_1_mean
+        if beta1 < 0 and beta2 < 0:
+        # if beta1 == -1.0 and beta2 == -1.0:
+            sim_1_mean = sim_token_1.mean()
+            sim_1_std = sim_token_1.std()
+            gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
+            gaussian_map = gaussian_map * sim_1_std + sim_1_mean
+            beta1 = beta1*-1.0
+            beta2 = beta2*-1.0
         sim_token_1 = torch.clamp((1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0), 0.0, 1.0)
 
         # Efficient Gaussian blending for tokens 2 onwards with broadcasting
         gaussian_map_exp = gaussian_map.expand_as(sim_tokens_rest)
-        sim_rest_mean = sim_tokens_rest.mean()
-        sim_rest_std = sim_tokens_rest.std()
-        gaussian_map_exp = (gaussian_map_exp - gaussian_map_exp.mean()) / (gaussian_map_exp.std() + 1e-5)
-        gaussian_map_exp = gaussian_map_exp * sim_rest_std + sim_rest_mean
+        # check if beta1 and beta2 are negative 
+        if beta1 < 0 and beta2 < 0:
+        # if beta1 == -1.0 and beta2 == -1.0:
+            sim_rest_mean = sim_tokens_rest.mean()
+            sim_rest_std = sim_tokens_rest.std()
+            gaussian_map_exp = (gaussian_map_exp - gaussian_map_exp.mean()) / (gaussian_map_exp.std() + 1e-5)
+            gaussian_map_exp = gaussian_map_exp * sim_rest_std + sim_rest_mean
         sim_tokens_rest = torch.clamp((1 - beta2) * sim_tokens_rest + beta2 * gaussian_map_exp, 0.0, 1.0)
 
         # Apply attention weights across all tokens
@@ -1707,20 +1714,20 @@ class DDIMSamplerWithGrad(object):
         #### ATTENTION GUIDANCE ####
         control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
         if control_attentions:
-            num_tokens = 77
-            a = torch.nn.Parameter(torch.rand(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter) with random values between 0 and 1
+            # num_tokens = 77
+            # a = torch.nn.Parameter(torch.rand(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter) with random values between 0 and 1
             
             # Add a to kwargs
-            kwargs['a_vector'] = a
-            kwargs['optimizing'] = True
+            # kwargs['a_vector'] = a
+            # kwargs['optimizing'] = True
             target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
             opt_steps = kwargs['optimization_steps']
             batch_idx = kwargs['batch_idx']
             logs_dir = kwargs['logs_dir']
             source_img = kwargs['source_img']
-            lr = kwargs['lr']
+            # lr = kwargs['lr']
 
-            optimizer = torch.optim.Adam([a], lr=lr)
+            # optimizer = torch.optim.Adam([a], lr=lr)
             
             # Prefill the grid for normal images and prompt maps
             num_timesteps_to_display = 6  # For Timestep 50, 40, 30, 20, 10, 0
@@ -1739,25 +1746,34 @@ class DDIMSamplerWithGrad(object):
                     index = total_steps - i - 1
 
                     if 'control_attentions' in kwargs:
-                        if index < 25:
-                            kwargs['control_attentions'] = False
-                            kwargs['optimizing'] = False
-                            print('Setting control attentions and optimizing to False')
+                        if index < 20:
+                            # kwargs['control_attentions'] = False
+                            beta1 = -0.1
+                            beta2 = -0.1
+                            kwargs['beta1'] = beta1
+                            kwargs['beta2'] = beta2
+                            # print('Setting control attentions to False')
+                        # else:
+                        #     # if index >= 30 and index < 45:
+                        #     #     beta1 = 1.0
+                        #     #     beta2 = 0.5
+                        #     # elif index > 45:
+                        #     #     beta1 = 1.0
+                        #     #     beta2 = 1.0
+                        #     # else:
+                        elif index < 45:
+                            beta1 = -1.0
+                            beta2 = -0.5
+                            kwargs['beta1'] = beta1
+                            kwargs['beta2'] = beta2
                         else:
-                            # if index >= 30 and index < 45:
-                            #     beta1 = 1.0
-                            #     beta2 = 0.5
-                            # elif index > 45:
-                            #     beta1 = 1.0
-                            #     beta2 = 1.0
-                            # else:
                             beta1 = 1.0
-                            beta2 = 1.0
+                            beta2 = 0.1
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
                             kwargs['control_attentions'] = True
-                            kwargs['optimizing'] = True
-                            print('Setting control attentions and optimizing back to True')
+                            # kwargs['optimizing'] = True
+                            # print('Setting control attentions and optimizing back to True')
                             
 
                     ts = torch.full((b,), step, device=device, dtype=torch.long)
@@ -1780,29 +1796,29 @@ class DDIMSamplerWithGrad(object):
                                             dynamic_threshold=dynamic_threshold, **kwargs)
                     img, pred_x0, attn_maps = outs
                     
-                    if kwargs['optimizing']:
-                        # get average attention maps from all layers
-                        avg_attn_maps = self.parse_attn_maps(attn_maps)
-                        # prompt_map = avg_attn_maps[:, :, 1]
-                        trailing_map = avg_attn_maps[:, :, 2:]
+                    # if kwargs['optimizing']:
+                    #     # get average attention maps from all layers
+                    #     avg_attn_maps = self.parse_attn_maps(attn_maps)
+                    #     # prompt_map = avg_attn_maps[:, :, 1]
+                    #     trailing_map = avg_attn_maps[:, :, 2:]
                         
-                        avg_map = torch.mean(trailing_map, dim=2)
-                        # avg_map = torch.mean(avg_attn_maps[:, :, 1:], dim=2)
+                    #     avg_map = torch.mean(trailing_map, dim=2)
+                    #     # avg_map = torch.mean(avg_attn_maps[:, :, 1:], dim=2)
                         
-                        # calculate loss
-                        loss = F.mse_loss(avg_map, target_map)
-                        loss.backward()
-                        optimizer.step()
+                    #     # calculate loss
+                    #     loss = F.mse_loss(avg_map, target_map)
+                    #     loss.backward()
+                    #     optimizer.step()
                         
-                        # update a vector
-                        a.data.clamp_(0, 1) # constrain between 0 and 1
-                        kwargs['a_vector'] = a
+                    #     # update a vector
+                    #     a.data.clamp_(0, 1) # constrain between 0 and 1
+                    #     kwargs['a_vector'] = a
                         
-                        wandb.log({'attn_guidance/loss': loss.item()})
-                        wandb.log({f'attn_guidance/a_{i}': a.tolist()[i] for i in tokens_to_display})
-                        # check if a has grad
-                        if a.grad is None:
-                            print('a has no grad')
+                    #     wandb.log({'attn_guidance/loss': loss.item()})
+                    #     wandb.log({f'attn_guidance/a_{i}': a.tolist()[i] for i in tokens_to_display})
+                    #     # check if a has grad
+                    #     if a.grad is None:
+                    #         print('a has no grad')
                     
                     # Check if `index` is in `timesteps_to_display`
                     if index in timesteps_to_display:
@@ -1828,11 +1844,11 @@ class DDIMSamplerWithGrad(object):
                     img = torch.randn(shape, device=device)
                 else:
                     img = x_T
-                img.requires_grad = True
-                kwargs['optimizing'] = True
+                # img.requires_grad = True
+                # kwargs['optimizing'] = True
                 kwargs['control_attentions'] = True
-                print(f'Optimization step {opt_step} completed')
-                print('Setting control attentions and optimizing back to True')
+                # print(f'Optimization step {opt_step} completed')
+                print('Setting control attentions back to True')
                 iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
             # Generate the image grid from the prefilled array for both normal images and prompt maps

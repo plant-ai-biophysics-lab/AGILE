@@ -1,11 +1,18 @@
 import torch
 import einops
+import copy
+import cv2
 import torch.nn as nn
 import numpy as np
 import tqdm
 import itertools
+import wandb
+import math
+import os
+import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch.nn.functional as F
+import torch.optim as optim
 
 from functools import partial
 from contextlib import contextmanager, nullcontext
@@ -14,12 +21,16 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from omegaconf import ListConfig
+from transformers import pipeline
+from PIL import Image
+from torchviz import make_dot
+from torch.optim.lr_scheduler import StepLR
 
 from src.modules import LitEma, make_beta_schedule, Encoder, Decoder, DiagonalGaussianDistribution, normal_kl, \
-                        DDIMSampler, IdentityFirstStage, SpatialTransformer
+                        DDIMSampler, IdentityFirstStage, SpatialTransformer, DDIMSamplerWithGrad
 from src.util import default, instantiate_from_config, count_params, exists, disabled_train, \
                         extract_into_tensor, mean_flat, noise_like, log_txt_as_img, isimage, ismap, \
-                            timestep_embedding, linear, conv_nd, zero_module
+                            timestep_embedding, linear, conv_nd, zero_module, get_attn_maps, checkpoint
 from src.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -535,7 +546,8 @@ class DDPM(pl.LightningModule):
                                   return_intermediates=return_intermediates)
 
     def q_sample(self, x_start, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
+        if noise is None:
+            noise = default(noise, lambda: torch.randn_like(x_start))
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
 
@@ -631,7 +643,14 @@ class DDPM(pl.LightningModule):
 
         self.log("global_step", self.global_step,
                  prog_bar=True, logger=True, on_step=True, on_epoch=False)
-
+        
+        # Log each item in the loss_dict on step
+        wandb.log({f"{k}": v for k, v in loss_dict.items()}, step=self.global_step)
+        wandb.log({"global_step": self.global_step}, step=self.global_step)
+        
+        # if batch_idx == 0:  # Visualize the graph for the first batch only to avoid clutter
+        #     make_dot(loss, params={"a": self.model.a}).render("attn_graph", format="png")
+        
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
@@ -750,6 +769,11 @@ class LatentDiffusion(DDPM):
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None
+        
+        # FOR TEXT EMBEDDING OPTIMIZATION
+        self.optimize_embeddings = False
+        self.attn_loss_weight = 1.0
+        self.save_attn_counter = 0
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -815,10 +839,14 @@ class LatentDiffusion(DDPM):
                 # self.be_unconditional = True
             else:
                 model = instantiate_from_config(config)
-                self.cond_stage_model = model.eval()
-                self.cond_stage_model.train = disabled_train
-                for param in self.cond_stage_model.parameters():
-                    param.requires_grad = False
+                if getattr(model, 'trainable', False):
+                    print(f"Training {self.__class__.__name__} with trainable cond stage.")
+                    self.cond_stage_model = model.train()
+                else:
+                    self.cond_stage_model = model.eval()
+                    self.cond_stage_model.train = disabled_train
+                    for param in self.cond_stage_model.parameters():
+                        param.requires_grad = False
         else:
             assert config != '__is_first_stage__'
             assert config != '__is_unconditional__'
@@ -853,6 +881,11 @@ class LatentDiffusion(DDPM):
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
             else:
+                # check if c is a list and all items are to device
+                if isinstance(c, list):
+                    c = [ci.to(self.device) for ci in c]
+                else:
+                    c = c.to(self.device)
                 c = self.cond_stage_model(c)
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
@@ -896,7 +929,7 @@ class LatentDiffusion(DDPM):
             weighting = weighting * L_weighting
         return weighting
 
-    def get_fold_unfold(self, x, kernel_size, stride, uf=1, df=1):  # todo load once not every time, shorten code
+    def get_fold_unfold(self, x, kernel_size, stride, uf=1, df=1):
         """
         :param x: img of size (bs, c, h, w)
         :return: n img crops of size (n, bs, c, kernel_size[0], kernel_size[1])
@@ -957,6 +990,15 @@ class LatentDiffusion(DDPM):
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach() # shape: (bs, c, h, w)
+        
+        # encode hint also in case needed
+        if 'hint' in batch.keys():
+            xy = super().get_input(batch, 'hint')
+            xy = xy.to(self.device)
+            hint_encoder_posterior = self.encode_first_stage(xy)
+            y = self.get_first_stage_encoding(hint_encoder_posterior).detach()
+        else:
+            y = None
 
         if self.model.conditioning_key is not None and not self.force_null_conditioning:
             if cond_key is None:
@@ -971,10 +1013,14 @@ class LatentDiffusion(DDPM):
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
-                if isinstance(xc, dict) or isinstance(xc, list):
+                # check if xc is already a tensor
+                if torch.is_tensor(xc):
+                    c = xc.squeeze(0)
+                elif isinstance(xc, dict) or isinstance(xc, list):
                     c = self.get_learned_conditioning(xc)
                 else:
-                    c = self.get_learned_conditioning(xc.to(self.device))
+                    # c = self.get_learned_conditioning(xc.to(self.device))
+                    c = self.get_learned_conditioning(xc).to(self.device)
             else:
                 c = xc
             if bs is not None:
@@ -991,7 +1037,14 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
-        out = [z, c]
+                
+        # get attention map
+        if 'attn_map' in batch.keys():
+            attn_map = batch['attn_map']
+        else:
+            attn_map = None
+            
+        out = [z, c, y, attn_map]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -1003,6 +1056,16 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
+        if predict_cids:
+            if z.dim() == 4:
+                z = torch.argmax(z.exp(), dim=1).long()
+            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
+            z = rearrange(z, 'b h w c -> b c h w').contiguous()
+
+        z = 1. / self.scale_factor * z
+        return self.first_stage_model.decode(z)
+    
+    def decode_first_stage_grad(self, z, predict_cids=False, force_not_quantize=False):
         if predict_cids:
             if z.dim() == 4:
                 z = torch.argmax(z.exp(), dim=1).long()
@@ -1028,20 +1091,20 @@ class LatentDiffusion(DDPM):
         return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, c)
+        x, y, c, attn_map = self.get_input(batch, self.first_stage_key)
+        loss = self(x, y, c, attn_map=attn_map)
         return loss
 
-    def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long() # timestep
+    def forward(self, x, y, c, *args, **kwargs):
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long() 
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
                 c = self.get_learned_conditioning(c)
-            if self.shorten_cond_schedule:  # TODO: drop this option
+            if self.shorten_cond_schedule:
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, y, c, t, *args, **kwargs)
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
         if isinstance(cond, dict):
@@ -1078,29 +1141,35 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
+    def p_losses(self, x_start, y_start, cond, t, noise=None, **kwargs):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+
+        if self.parameterization == "eps_attn":
+            model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True, 
+                                                       control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0),
+                                                       attn_weights=self.model.a)
+        else:
+            model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
 
         if self.parameterization == "x0":
             target = x_start
-        elif self.parameterization == "eps":
+        elif self.parameterization == "eps" or self.parameterization == "eps_attn":
             target = noise
         elif self.parameterization == "v":
             target = self.get_v(x_start, noise, t)
         else:
             raise NotImplementedError()
 
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        # Get diffusion loss
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3]) 
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
@@ -1112,8 +1181,133 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
+        
+        # Get attention loss
+        if self.parameterization == "eps_attn":
+            avg_attn, all_token_attns = self.get_avg_attn(attn_maps)
+            target_attn = kwargs['attn_map'].squeeze(0)
 
+            # Visualize source and target attn at every 250 steps
+            if self.save_attn_counter % 250 == 0:
+                self.save_attn(avg_attn, target_attn, all_token_attns, self.save_attn_counter, timestep=int(t), save_dir=self.logger.save_dir)
+            
+            attn_loss = torch.nn.functional.mse_loss(avg_attn, target_attn)
+            # loss = loss + self.attn_loss_weight * attn_loss
+            loss = self.attn_loss_weight * attn_loss
+
+            loss_dict.update({f'{prefix}/attn_loss': attn_loss})
+            loss_dict.update({f'{prefix}/loss_with_attn': loss})
+            self.save_attn_counter += 1
         return loss, loss_dict
+    
+    @staticmethod
+    def save_attn(avg_attn, target_attn, all_token_attns, global_step, timestep, save_dir):
+        # Ensure save_dir exists
+        if not os.path.exists(f'{save_dir}/attn_loss'):
+            os.makedirs(f'{save_dir}/attn_loss')
+
+        # Tokens to visualize: token 0, 1, 10, 20, 40, and 70
+        tokens_to_save = [0, 1, 10, 20, 40, 70]
+
+        # Number of attention maps (each entry in all_token_attns represents a different map)
+        num_attn_maps = len(all_token_attns)
+
+        # Layer titles (for each row, assuming layers 3 to 11)
+        layer_titles = ['Layer 3', 'Layer 4', 'Layer 5', 'Layer 6', 'Layer 7', 'Layer 8', 'Layer 9', 'Layer 10', 'Layer 11']
+
+        # Set grid size: rows = number of attention maps + 1 (for source/target comparison), columns = number of tokens to visualize
+        grid_rows = num_attn_maps + 1  # +1 for source-target comparison
+        grid_cols = len(tokens_to_save)
+
+        # Create a grid plot to show attention maps for selected tokens
+        fig, axes = plt.subplots(grid_rows, grid_cols, figsize=(grid_cols * 3, grid_rows * 3))
+
+        # Ensure axes is a 2D array for easy iteration
+        axes = np.array(axes).reshape(grid_rows, grid_cols)
+
+        ### Plot Source (avg_attn) and Target Attention for Token 1 ###
+        # Convert average attention map to image
+        source_attn_img = plt.cm.viridis(avg_attn.detach().cpu().numpy()) * 255  # Use avg_attn as source attention
+        source_attn_img = source_attn_img.astype(np.uint8)
+
+        target_attn_img = plt.cm.viridis(target_attn.detach().cpu().numpy()) * 255  # Target attention
+        target_attn_img = target_attn_img.astype(np.uint8)
+
+        # Plot source attention (first column)
+        axes[0][0].imshow(source_attn_img)
+        axes[0][0].set_title(f'Source (avg_attn)', fontsize=10)
+        axes[0][0].axis('off')
+
+        # Plot target attention (second column, token 1)
+        axes[0][1].imshow(target_attn_img)
+        axes[0][1].set_title(f'Target Token 1', fontsize=10)
+        axes[0][1].axis('off')
+
+        # Fill in the remaining empty cells in the first row (if any)
+        for col in range(2, grid_cols):
+            axes[0][col].axis('off')
+
+        ### Plot Attention Maps for Each Layer and Token ###
+        for row, attn_map in enumerate(all_token_attns, start=1):  # Start at row 1 because row 0 is for source/target comparison
+            for col, token_idx in enumerate(tokens_to_save):
+                # Get the attention map for the specific token
+                token_attn_img = plt.cm.viridis(attn_map[token_idx].detach().cpu().numpy()) * 255
+                token_attn_img = token_attn_img.astype(np.uint8)
+
+                # Plot the token attention map
+                axes[row][col].imshow(token_attn_img)
+                axes[row][col].set_title(f'Token {token_idx}', fontsize=10)
+                axes[row][col].axis('off')
+
+            # Add the vertical column title to the far right of the grid (Layer 3, 4, etc.)
+            axes[row][0].annotate(layer_titles[row - 1], xy=(0, 0.5), xytext=(-axes[row][0].yaxis.labelpad - 5, 0),
+                                xycoords=axes[row][0].yaxis.label, textcoords='offset points',
+                                size='large', ha='center', va='center', rotation=90)
+
+        # Adjust layout to reduce all unnecessary space, especially at the top
+        plt.subplots_adjust(left=0.1, right=0.9, top=0.95, bottom=0.1, wspace=0.4, hspace=0.4)
+
+        # Save the entire grid as a single image
+        plt.savefig(f'{save_dir}/attn_loss/step-{global_step}_time-{timestep}_tokens_grid.png', bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+    
+    @staticmethod
+    def get_avg_attn(attn_maps, type='attn2', target_size=(512, 512)):
+        all_token_attns = []  # Store attention maps for each token for each attention layer/map
+        avg_maps = []
+
+        for _, (_, attn_map) in enumerate(attn_maps.items()):
+            for attn_type, values in attn_map[0].items():
+                if attn_type == type:
+                    num_tokens = values.shape[2]  # Number of tokens, assumed to be 77
+                    token_attns = []  # Store individual token attention maps for this layer
+
+                    # Collect attention maps for all tokens in this map (for example, 77 tokens)
+                    for token_idx in range(num_tokens):
+                        token_attn = values[:, :, token_idx].mean(dim=0)  # Average across heads
+                        map_size = int(math.sqrt(token_attn.shape[-1]))
+                        token_attn = token_attn.view(map_size, map_size)
+                        token_attn = token_attn.unsqueeze(0).unsqueeze(0)
+                        token_attn = nn.functional.interpolate(
+                            token_attn, size=target_size, mode='bilinear', align_corners=False)
+                        token_attn = token_attn.squeeze(0).squeeze(0)
+
+                        # Normalize between 0 and 1
+                        token_attn = (token_attn - token_attn.min()) / (token_attn.max() - token_attn.min())
+
+                        token_attns.append(token_attn)  # Save token's attention map for this layer
+
+                    # Save all token attention maps for this layer
+                    all_token_attns.append(token_attns)
+
+                    # Compute average attention map for this layer (over all tokens)
+                    avg_map = torch.stack(token_attns, dim=0).mean(dim=0)
+                    avg_maps.append(avg_map)
+
+        # Compute global average attention map across all layers
+        avg_attn = torch.stack(avg_maps, dim=0).mean(dim=0)
+
+        return avg_attn, all_token_attns
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
@@ -1515,101 +1709,167 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: target c: mask
-        control = batch[self.control_key] # control: hint (condition)
+        x, c, y, attn_map = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: synthetic c: prompt y: real
+        control = batch[self.control_key]
         if bs is not None:
             control = control[:bs]
         control = control.to(self.device)
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+        # return x, dict(c_crossattn=[c], c_concat=None)
+        return x, y, dict(c_crossattn=[c], c_concat=[control]), attn_map # c_crossattn: condition / c_concat: hint (synthetic)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        
+        # check if save attention is in kwargs
+        save_attention = kwargs.get('save_attention', False)
+        
+        # check if optimizing is in kwargs
+        optimizing = kwargs.get('optimizing', False)
+        
+        # check if control_attentions is in kwargs
+        control_attentions = kwargs.get('control_attentions', False)
+        
+        # check if gaussian_map is in kwargs else None
+        gaussian_map = kwargs.get('gaussian_map', None)
+        
+        # check if attention weights are in kwargs else None
+        attn_weights = kwargs.get('attn_weights', None)
+        
+        # get beta values
+        beta1 = kwargs.get('beta1', 1.0)
+        beta2 = kwargs.get('beta2', 0.1)
+        
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
-        cond_txt = torch.cat(cond['c_crossattn'], 1)
+        if optimizing:
+            with torch.enable_grad():
+                cond_txt = torch.cat(cond['c_crossattn'], 1)
+                # cond_txt.retain_grad()
+        else:
+            cond_txt = torch.cat(cond['c_crossattn'], 1)
+        # require grad if cond['c_crossattn'] required grad
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
-
-        return eps
+            if optimizing:
+                with torch.enable_grad():
+                    control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt, optimizing=optimizing)
+                    control = [c * scale for c, scale in zip(control, self.control_scales)]
+                    if save_attention:
+                        eps, attn_maps_layer = diffusion_model(
+                            x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention, 
+                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                        )
+                        return eps, attn_maps_layer
+                    else:
+                        eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention)
+                        return eps
+            else:
+                control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+                control = [c * scale for c, scale in zip(control, self.control_scales)]
+                if save_attention:
+                    eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
+                                                           control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                    return eps, attn_maps_layer
+                else:
+                    eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                    return eps
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
-        # return self.get_learned_conditioning([""] * N)
-        return self.get_learned_conditioning(torch.zeros([N, 1, 512, 512]).to(self.device))
+        return self.get_learned_conditioning([""] * N)
+        # return self.get_learned_conditioning(torch.zeros([N, 3, 512, 512]).to(self.device)).to(self.device)
 
     @torch.no_grad()
-    def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
+    def log_images(self, batch, N=1, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
-                   plot_diffusion_rows=False, unconditional_guidance_scale=9.0, unconditional_guidance_label=None,
+                   plot_diffusion_rows=False, unconditional_guidance_scale=20.0, unconditional_guidance_label=None,
                    use_ema_scope=True,
                    **kwargs):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
-        N = min(z.shape[0], N)
-        n_row = min(z.shape[0], n_row)
+        z, _, c, _ = self.get_input(batch, self.first_stage_key, bs=N)
+        if c["c_concat"] is not None:
+            c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+            # log["control"] = c_cat * 2.0 - 1.0
+            log["control"] = c_cat
+        else:
+            c_cat, c = None, c["c_crossattn"][0][:N]
+        # N = min(z.shape[0], N)
+        # n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
-        log["control"] = c_cat * 2.0 - 1.0
         # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
-        log["conditioning"] = self.decode_cond_stage(c)
+        # log["conditioning"] = self.decode_cond_stage(c)
 
-        if plot_diffusion_rows:
-            # get diffusion row
-            diffusion_row = list()
-            z_start = z[:n_row]
-            for t in range(self.num_timesteps):
-                if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
-                    t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
-                    t = t.to(self.device).long()
-                    noise = torch.randn_like(z_start)
-                    z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
-                    diffusion_row.append(self.decode_first_stage(z_noisy))
+        # if plot_diffusion_rows:
+        #     # get diffusion row
+        #     diffusion_row = list()
+        #     z_start = z[:n_row]
+        #     for t in range(self.num_timesteps):
+        #         if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+        #             t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
+        #             t = t.to(self.device).long()
+        #             noise = torch.randn_like(z_start)
+        #             z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
+        #             diffusion_row.append(self.decode_first_stage(z_noisy))
 
-            diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
-            diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
-            diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
-            diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
-            log["diffusion_row"] = diffusion_grid
+        #     diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
+        #     diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
+        #     diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
+        #     diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
+        #     log["diffusion_row"] = diffusion_grid
 
-        if sample:
-            # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                                     batch_size=N, ddim=use_ddim,
-                                                     ddim_steps=ddim_steps, eta=ddim_eta)
-            x_samples = self.decode_first_stage(samples)
-            log["samples"] = x_samples
-            if plot_denoise_rows:
-                denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
-                log["denoise_row"] = denoise_grid
+        # if sample:
+        #     # get denoise row
+        #     samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+        #                                              batch_size=N, ddim=use_ddim,
+        #                                              ddim_steps=ddim_steps, eta=ddim_eta)
+        #     x_samples = self.decode_first_stage(samples)
+        #     log["samples"] = x_samples
+        #     if plot_denoise_rows:
+        #         denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
+        #         log["denoise_row"] = denoise_grid
 
         if unconditional_guidance_scale > 0.0:
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            samples_cfg, intermediates = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
                                              unconditional_conditioning=uc_full,
+                                             **kwargs
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
+            x_samples_attn_maps = get_attn_maps(intermediates['attn_maps'])
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
+            log["attn_maps"] = x_samples_attn_maps
 
         return log
 
     @torch.no_grad()
     def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
         ddim_sampler = DDIMSampler(self)
-        b, c, h, w = cond["c_concat"][0].shape
+        if cond["c_concat"][0] is not None:
+            b, _, h, w = cond["c_concat"][0].shape
+        else:
+            b, _, h, w = cond["c_crossattn"][0].shape
+        shape = (self.channels, h // 8, w // 8)
+        samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, **kwargs)
+        return samples, intermediates
+    
+    def sample_log_with_grad(self, cond, batch_size, ddim, ddim_steps, **kwargs):
+        ddim_sampler = DDIMSamplerWithGrad(self)
+        if cond["c_concat"][0] is not None:
+            b, _, h, w = cond["c_concat"][0].shape
+        else:
+            b, _, h, w = cond["c_crossattn"][0].shape
         shape = (self.channels, h // 8, w // 8)
         samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, **kwargs)
         return samples, intermediates
@@ -1637,7 +1897,28 @@ class ControlLDM(LatentDiffusion):
 
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
+        
+        # check if optimizing in kwargs
+        optimizing = kwargs.get('optimizing', False)
+        
+        # check if control attentions in kwargs
+        control_attentions = kwargs.get('control_attentions', False)
+        
+        # check if gaussian_map is in kwargs else None
+        gaussian_map = kwargs.get('gaussian_map', None)
+        
+        # check if attn_weights is in kwargs else None
+        attn_weights = kwargs.get('attn_weights', None)
+        
+        # get betas
+        beta1 = kwargs.get('beta1', 1.0)
+        beta2 = kwargs.get('beta2', 0.1)
+        
+        # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
+        layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+        layers_to_control = [3, 4, 5, 6, 7, 8]
+        attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
             emb = self.time_embed(t_emb)
@@ -1649,26 +1930,35 @@ class ControlledUnetModel(UNetModel):
 
         if control is not None:
             h += control.pop()
-
+        
         for i, module in enumerate(self.output_blocks):
             if only_mid_control or control is None:
                 h = torch.cat([h, hs.pop()], dim=1)
             else:
-                # print(h.shape, (hs[-1] + control[-1]).shape)
-                # h = torch.cat([h, hs.pop() + control.pop()], dim=1)
                 h1 = hs.pop() + control.pop()
-                h2 = h
-
-                # Pad h1 to match the size of h2
-                # if h1.shape[2:] != h2.shape[2:]:
-                #     pad = (0, h2.shape[3] - h1.shape[3], 0, h2.shape[2] - h1.shape[2])  # Padding on last two dimensions
-                #     h1 = F.pad(h1, pad)
+                # h2 = h
 
                 h = torch.cat([h, h1], dim=1)
-            h = module(h, emb, context)
+            
+            # check if i is in the list of indices where we want to view the attention
+            if i in layers_to_save and 'save_attention' in kwargs and kwargs['save_attention']:
+                layer = i
+                if i in layers_to_control:
+                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, 
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                else:
+                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing)
+                attn_maps_layer[layer] = attn_maps
+            else:
+                h = module(h, emb, context)
 
         h = h.type(x.dtype)
-        return self.out(h)
+        
+        # return attention maps if not empty
+        if len(attn_maps_layer) > 0:
+            return self.out(h), attn_maps_layer
+        else: 
+            return self.out(h)
 
 class ControlNet(nn.Module):
     def __init__(
@@ -1905,8 +2195,12 @@ class ControlNet(nn.Module):
 
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
-
+    
     def forward(self, x, hint, timesteps, context, **kwargs):
+        
+        # check if `optimizing` is in kwargs
+        optimizing = kwargs.get('optimizing', False)
+        
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
@@ -1917,15 +2211,266 @@ class ControlNet(nn.Module):
         h = x.type(self.dtype)
         for module, zero_conv in zip(self.input_blocks, self.zero_convs):
             if guided_hint is not None: # for adding hint and condition
-                h = module(h, emb, context=None)
+                h = module(h, emb, context=None) # make h (synthetic) same shape as hint (real)
                 
                 h += guided_hint
                 guided_hint = None
             else:
-                h = module(h, emb, context)
+                h = module(h, emb, context, optimizing=optimizing)
             outs.append(zero_conv(h, emb, context))
 
-        h = self.middle_block(h, emb, context)
-        outs.append(self.middle_block_out(h, emb, context))
+        h = self.middle_block(h, emb, context, optimizing=optimizing)
+        outs.append(self.middle_block_out(h, emb, context, optimizing=optimizing))
 
         return outs
+    
+class TextEmbeddingOptimizer:
+    def __init__(
+        self,
+        prompt,
+        model,
+        batch_size,
+        lr,
+        ddim_steps,
+        unconditional_guidance_scale,
+        timestep_to_optimize='timestep_30', # TODO: Try optimizing at an earlier timestep
+        logs_dir='optimize_logs',
+        optimization_steps=100,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.model = model.train()
+        self.batch_size = batch_size
+        self.lr = lr
+        self.ddim_steps = ddim_steps
+        self.unconditional_guidance_scale = unconditional_guidance_scale
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.logs_dir = logs_dir
+
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
+
+        self.model = self.model.to(self.device)
+
+        # Get text embedding and make it a leaf tensor
+        self.prompt = prompt
+
+        # For optimization parameters
+        self.timestep_to_optimize = timestep_to_optimize
+        self.att_type = 'attn2'
+        self.target_size = (512, 512)
+        self.opt_steps = optimization_steps
+
+        # Loss function
+        self.mse_loss = nn.MSELoss()
+        
+        # clear torch cache
+        torch.cuda.empty_cache()
+
+    def parse_attn_maps(self, attn_maps, timestep_to_optimize):
+        
+        for _, attn_map_step in enumerate(attn_maps):
+            (timestep, attn_map_layers), = attn_map_step.items()
+            if timestep == timestep_to_optimize:
+                all_maps_in_layer = []
+                # attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
+                for _, (_, attn_map) in enumerate(attn_map_layers.items()):
+                    for attn_type, values in attn_map[0].items():
+                        if attn_type == self.att_type:
+                            # keep only class token
+                            values = values[:, :, 1] # TODO: use the first token (grape)
+                            a_map = values.mean(dim=0)
+                            map_size = int(math.sqrt(a_map.shape[-1]))
+                            a_map = a_map.view(map_size, map_size)
+                            a_map = a_map.unsqueeze(0).unsqueeze(0)
+                            a_map = nn.functional.interpolate(
+                                a_map, size=self.target_size, mode='bilinear', align_corners=False)
+                            a_map = a_map.squeeze(0).squeeze(0)
+                            all_maps_in_layer.append(a_map)
+
+                all_maps_in_layer = torch.stack(all_maps_in_layer, dim=0)
+                all_maps_in_layer = all_maps_in_layer.mean(dim=0)
+
+                # Normalize between 0 and 1
+                all_maps_in_layer = (all_maps_in_layer - all_maps_in_layer.min()) / (
+                        all_maps_in_layer.max() - all_maps_in_layer.min())
+
+                break
+
+        return all_maps_in_layer
+
+    def train(self, dataloader, num_epochs):
+        # if prompt is tensor, skip encoding
+        if isinstance(self.prompt, torch.Tensor):
+            print("Using optimized embedding!")
+            text_embedding = self.prompt.clone().detach().to(self.device)
+        else:
+            latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
+            text_embedding = latent_from_prompt.clone().detach().to(self.device)
+        text_embedding.requires_grad = True
+        
+        # freeze model parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.eval()
+
+        optimizer = optim.AdamW([text_embedding], lr=self.lr)
+        scheduler = StepLR(optimizer, step_size=100, gamma=0.5)
+        
+        initial_params = {name: param.clone() for name, param in self.model.named_parameters()}
+        
+        current_step = 0
+        for epoch in range(num_epochs):
+            for batch_idx, batch in enumerate(dataloader):
+                N = self.batch_size
+                use_ddim = self.ddim_steps is not None
+
+                # Get input data
+                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                c_cat = c["c_concat"][0][:N]
+
+                uc_cross = self.model.get_unconditional_conditioning(N)
+                uc_cat = c_cat
+                uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
+
+                # Loop through optimization steps
+                for _ in range(self.opt_steps):
+                    optimizer.zero_grad()
+                    
+                    generated, intermediates = self.model.sample_log_with_grad(
+                        cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
+                        batch_size=N, ddim=use_ddim,
+                        ddim_steps=self.ddim_steps,
+                        unconditional_guidance_scale=self.unconditional_guidance_scale,
+                        unconditional_conditioning=uc_full
+                    )
+
+                    # Post-process the generated result
+                    generated = self.model.decode_first_stage(generated)
+                    source_attn_map = intermediates['attn_maps']
+                    source_attn_map = self.parse_attn_maps(source_attn_map, self.timestep_to_optimize).to(self.device)
+                    target_attn_map = batch['attn_map'].squeeze(0).to(self.device)
+
+                    # Compute loss and backward pass
+                    loss = self.mse_loss(source_attn_map, target_attn_map)
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    
+                    for name, param in self.model.named_parameters():
+                        if not torch.equal(param, initial_params[name]):
+                            print(f"Parameter {name} has changed!")
+
+                    # Check if loss updated embedding
+                    if text_embedding.grad is None:
+                        print('Text Embedding did not update. Check Computation Graph!')
+                
+                    # Log images every 10 optimization steps
+                    if _ % 10 == 0:
+                        self.log_images(generated, target_attn_map, source_attn_map, batch_idx, _)
+
+                    print(f"Epoch: {epoch}, Batch: {batch_idx}, Opt_step: {_}, Loss: {loss.item()}")
+                    print(f"Learing Rate: {scheduler.get_last_lr()}")
+
+                    # Log optimization loss with wandb
+                    wandb.log({'optimization/loss': loss.item()}, step=current_step)
+                    current_step += 1
+        
+        # Retrieve and save the optimized embeddings
+        optimized_embeddings = text_embedding.detach().cpu()
+        torch.save(optimized_embeddings, os.path.join(self.logs_dir, "optimized_embeddings.pt"))
+
+    def log_images(self, generated, target_attn_map, source_attn_map, idx, opt_steps):
+        generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+        generated = (generated - generated.min()) / (generated.max() - generated.min())
+        generated = (generated * 255).astype(np.uint8)
+
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+        ax[0].imshow(generated)
+        ax[0].axis('off')
+        ax[0].set_title('Generated Image')
+
+        ax[1].imshow(target_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[1].axis('off')
+        ax[1].set_title('Target Attention Map')
+
+        ax[2].imshow(source_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[2].axis('off')
+        ax[2].set_title('Source Attention Map')
+
+        plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+        
+class AttentionGuidance:
+    
+    def __init__(
+        self,
+        prompt,
+        model,
+        batch_size,
+        lr,
+        ddim_steps,
+        unconditional_guidance_scale,
+        logs_dir='control_logs',
+        optimization_steps=50,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.model = model.train()
+        self.batch_size = batch_size
+        self.lr = lr
+        self.ddim_steps = ddim_steps
+        self.unconditional_guidance_scale = unconditional_guidance_scale
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.logs_dir = logs_dir
+        self.prompt = prompt
+        self.optimization_steps = optimization_steps
+        
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
+        
+        self.model = self.model.to(self.device)
+        
+        # clear torch cache
+        torch.cuda.empty_cache()
+
+    def train(self, dataloader, num_epochs):
+        
+        # get prompt embedding
+        if isinstance(self.prompt, torch.Tensor):
+            print("Using optimized embedding!")
+            text_embedding = self.prompt.clone().detach().to(self.device)
+        else:
+            latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
+            text_embedding = latent_from_prompt.clone().detach().to(self.device)
+        
+        for epoch in range(num_epochs):
+            for batch_idx, batch in enumerate(dataloader):
+                N = self.batch_size
+                use_ddim = self.ddim_steps is not None
+                
+                # Get input data
+                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                c_cat = c["c_concat"][0][:N]
+                uc_cross = self.model.get_unconditional_conditioning(N)
+                uc_cat = c_cat
+                uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
+                
+                # get target attention map from batch
+                gaussian_map = batch['attn_map'].squeeze(0).to(self.device)
+                
+                # Sample generation and attention maps
+                generated, intermediates = self.model.sample_log_with_grad(
+                    cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
+                    batch_size=N, ddim=use_ddim,
+                    ddim_steps=self.ddim_steps,
+                    unconditional_guidance_scale=self.unconditional_guidance_scale,
+                    unconditional_conditioning=uc_full,
+                    control_attentions=True,
+                    gaussian_map=gaussian_map,
+                    optimization_steps=self.optimization_steps,
+                    batch_idx=batch_idx,
+                    logs_dir=self.logs_dir,
+                    source_img=batch['hint'],
+                    lr=self.lr
+                )

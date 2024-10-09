@@ -9,6 +9,8 @@ from einops import repeat
 from omegaconf import OmegaConf
 from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+import cv2
 
 def initialize_weights(tensor):
     if tensor.ndimension() == 2:  # Check if the tensor is a linear layer weight
@@ -275,5 +277,137 @@ def normalization(channels):
 
 class PermuteTransform:
     def __call__(self, x):
-        # Permute dimensions from [3, 416, 416] to [416, 3, 416]
-        return x.permute(2, 1, 0)
+        # Permute dimensions from [512, 512, 3] to [512, 3, 512]
+        # Only permute if 3 channels are present
+        if len(np.array(x).shape) == 2:
+            return x
+        else:
+            return np.transpose(x, (0, 1, 2))
+    
+def get_attn_maps(attn_maps, num_layers = 9):
+    
+    # store attention type into a display grid (columns: timesteps and rows: layers)
+    
+    # create empty array to store attention maps (single column first of length layers)
+    agg_maps = torch.zeros((num_layers+1, len(attn_maps), 512, 512))
+    att_types = ['attn2']
+    target_size = (512, 512)
+    column_titles = []
+    row_titles = ['Layer 3', 'Layer 4', 'Layer 5', 'Layer 6', 
+                  'Layer 7', 'Layer 8', 'Layer 9', 'Layer 10',
+                  'Layer 11', 'Average']
+    
+    # iterate attn map for each timestep
+    for i, attn_map_step in enumerate(attn_maps):
+        
+        # get timestep key and value
+        (timestep, attn_map_layers), = attn_map_step.items()
+        column_titles.append(timestep)
+        
+        # loop through each layer
+        all_maps_in_layer = []
+        for j, (layer, attn_map) in enumerate(attn_map_layers.items()):
+            
+            for attn_type, values in attn_map[0].items():
+                    
+                # only keep attn_types
+                if attn_type in att_types:
+                    
+                    # get the attention map
+                    values = values[:, :, 1] # keep only the class token # TODO: use the first token (grape)
+                    a_map = values.mean(dim=0) # take the mean
+                    
+                    # reshape into grid
+                    map_size = int(math.sqrt(a_map.shape[-1]))
+                    a_map = a_map.view(map_size, map_size)
+                    
+                    # assuming shape is (heads, sequence length), add batch dimension and head dimension
+                    a_map = a_map.unsqueeze(0).unsqueeze(0)
+                    
+                    # interpolate to target size
+                    a_map = nn.functional.interpolate(a_map, size=target_size, mode='bilinear', align_corners=False)
+                    
+                    # remove batch and head dimension
+                    a_map = a_map.squeeze(0).squeeze(0)
+                    
+                    # add to list of maps for averaging
+                    all_maps_in_layer.append(a_map)
+                    
+                    # store attention map in the display grid
+                    agg_maps[j, i] = a_map.cpu().detach()
+            
+        # add avg map to display grid
+        all_maps_in_layer = torch.stack(all_maps_in_layer, dim=0)
+        all_maps_in_layer = all_maps_in_layer.mean(dim=(0))
+        agg_maps[j+1, i] = all_maps_in_layer.cpu().detach()
+    
+    # normalize all maps to [0, 1]
+    # agg_maps = (agg_maps - agg_maps.min()) / (agg_maps.max() - agg_maps.min())
+    
+    return {
+        'agg_maps': agg_maps,
+        'column_titles': column_titles,
+        'row_titles': row_titles
+    }
+    
+def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, save_path, alpha=0.8):
+    """
+    Visualizes aggregated attention maps in a grid layout and saves the visualization as an image.
+
+    :param agg_maps: Tensor of shape (num_layers, num_timesteps, H, W) containing attention maps.
+    :param rgb_image: RGB image tensor.
+    :param column_titles: List of column titles (timesteps).
+    :param row_titles: List of row titles (layer names).
+    :param save_path: File path to save the visualization image.
+    :param alpha: Alpha value for overlay transparency.
+    """
+    num_layers, num_timesteps, H, W = agg_maps.shape
+
+    # Prepare the RGB image for overlay
+    rgb_image = rgb_image.squeeze(0).permute(1, 2, 0).cpu().numpy()  # Shape: (H, W, 3)
+    rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())  # Normalize to [0, 1]
+    rgb_image = (rgb_image * 255).astype(np.uint8)  # Convert to uint8 for display
+
+    fig, axes = plt.subplots(nrows=num_layers, ncols=num_timesteps, figsize=(num_timesteps * 2, num_layers * 2))
+
+    for i in range(num_layers):
+        for j in range(num_timesteps):
+            ax = axes[i, j]
+            attention_map = agg_maps[i, j].cpu().detach().numpy()
+
+            # Normalize the attention map
+            attention_map -= attention_map.min()
+            attention_map /= attention_map.max()
+
+            # Resize attention map to match the size of the RGB image
+            attention_resized = cv2.resize(attention_map, (rgb_image.shape[1], rgb_image.shape[0]))
+
+            # Apply colormap to the attention map (change from JET to VIRIDIS)
+            attention_colored = cv2.applyColorMap((attention_resized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+            attention_colored = cv2.cvtColor(attention_colored, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+
+            # Overlay attention map on the RGB image
+            overlayed_image = (1 - alpha) * rgb_image + alpha * attention_colored
+            overlayed_image = np.clip(overlayed_image / 255, 0, 1)  # Normalize for display
+
+            # Display the overlayed image
+            ax.imshow(overlayed_image, aspect='auto')
+            ax.axis('off')
+
+            # Set row titles (layer names)
+            if j == 0:
+                ax.axis('on')
+                ax.set_xticks([])  # Hide x-axis ticks
+                ax.set_yticks([])  # Hide y-axis ticks
+                ax.set_ylabel(row_titles[i], rotation=90, size='small', labelpad=20, va='center_baseline', ha='right')
+
+            # Set column titles (timestep values)
+            if i == 0:
+                ax.set_title(column_titles[j], size='small')
+                
+    # Add colorbar
+    cbar = fig.colorbar(plt.cm.ScalarMappable(cmap='viridis'), ax=axes.ravel().tolist(), shrink=0.95, orientation='horizontal', pad=0.05)
+    cbar.set_label('Attention Intensity')
+
+    # Save the figure as an image
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')

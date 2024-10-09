@@ -68,15 +68,32 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None):
+    def forward(self, x, emb, context=None, **kwargs):
+        optimizing = kwargs['optimizing'] if 'optimizing' in kwargs else False
+        control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
+        gaussian_map = kwargs['gaussian_map'] if 'gaussian_map' in kwargs else None
+        attn_weights = kwargs['attn_weights'] if 'attn_weights' in kwargs else None
+        beta1 = kwargs['beta1'] if 'beta1' in kwargs else 1.0
+        beta2 = kwargs['beta2'] if 'beta2' in kwargs else 0.1
         for layer in self:
             if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
+                x = layer(x, emb) # TODO: Use pytorch checkpoint                                    
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
+                # check if 'layer' is in kwargs
+                if 'layer' in kwargs:
+                    x, attn_maps = layer(x, context, layer=kwargs['layer'], optimizing=optimizing, 
+                                         control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                                        )
+                else:
+                    x = layer(x, context, optimizing=optimizing)
             else:
                 x = layer(x)
-        return x
+        
+        # return attn maps if exists
+        if 'attn_maps' in locals():
+            return x, attn_maps
+        else:
+            return x
 
 
 class Upsample(nn.Module):
@@ -303,7 +320,7 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        return checkpoint(self._forward, (x,), self.parameters(), True)
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):

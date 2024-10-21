@@ -175,11 +175,9 @@ def main(args):
             prompt=prompt,
             model=model,
             batch_size=args.batch_size,
-            lr=1.0,
             ddim_steps=50,
             unconditional_guidance_scale=20.0,
             logs_dir=os.path.join(args.logs_dir, "attention_guidance"),
-            optimization_steps=args.optimize_steps
         )
         
         attention_guidance.train(dataloader_debug, num_epochs=args.optimize_epochs)

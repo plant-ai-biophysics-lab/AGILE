@@ -2408,23 +2408,19 @@ class AttentionGuidance:
         prompt,
         model,
         batch_size,
-        lr,
         ddim_steps,
         unconditional_guidance_scale,
         logs_dir='control_logs',
-        optimization_steps=50,
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.model = model.train()
         self.batch_size = batch_size
-        self.lr = lr
         self.ddim_steps = ddim_steps
         self.unconditional_guidance_scale = unconditional_guidance_scale
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.logs_dir = logs_dir
         self.prompt = prompt
-        self.optimization_steps = optimization_steps
         
         if not os.path.exists(self.logs_dir):
             os.makedirs(self.logs_dir)
@@ -2468,9 +2464,7 @@ class AttentionGuidance:
                     unconditional_conditioning=uc_full,
                     control_attentions=True,
                     gaussian_map=gaussian_map,
-                    optimization_steps=self.optimization_steps,
                     batch_idx=batch_idx,
                     logs_dir=self.logs_dir,
                     source_img=batch['hint'],
-                    lr=self.lr
                 )

@@ -2,6 +2,7 @@ import torch
 import os
 import math
 import wandb
+import time
 import numpy as np
 import torch.nn.functional as F
 import torchvision.utils as vutils
@@ -1003,59 +1004,55 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, beta1=1.0, beta2=0.1, attn_weights=None):
-        
-        # target size is gaussian map shape
+    def apply_attention_edit(self, sim_target, gaussian_map, beta1=1.0, beta2=1.0, attn_weights=None, gamma=1.0):
+        # Extract necessary sizes
         target_size = gaussian_map.shape[-1]
-        
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads, num_tokens = sim_target.shape[0], sim_target.shape[2]
 
-        # Reshape sim_target to [num_heads, num_tokens, map_size, map_size] -> [num_heads, map_size, map_size, num_tokens]
+        # Reshape sim_target to [num_heads, map_size, map_size, num_tokens] directly
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
 
-        # Only upsample sim_target if necessary
+        # Only upsample sim_target if needed
         if map_size != target_size:
             sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
-        # Separate token 1 and tokens 2 onwards
-        sim_token_1, sim_tokens_rest = sim_target[:, 1, :, :], sim_target[:, 2:, :, :]
+        # Split token 1 and the rest
+        sim_token_1 = sim_target[:, 1, :, :]
+        sim_tokens_rest = sim_target[:, 2:, :, :]
 
-        # Efficient Gaussian blending for token 1
-        if beta1 < 0 and beta2 < 0:
-        # if beta1 == -1.0 and beta2 == -1.0:
-            sim_1_mean = sim_token_1.mean()
-            sim_1_std = sim_token_1.std()
-            gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
-            gaussian_map = gaussian_map * sim_1_std + sim_1_mean
-            beta1 = beta1*-1.0
-            beta2 = beta2*-1.0
-        sim_token_1 = torch.clamp((1 - beta1) * sim_token_1 + beta1 * gaussian_map.squeeze(0), 0.0, 1.0)
+        # Gaussian blending for token 1 (in-place when possible)
+        sim_1_mean, sim_1_std = sim_token_1.mean(), sim_token_1.std()
+        # print(f"sim_1_mean: {sim_1_mean}, sim_1_std: {sim_1_std}")
+        # gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
+        scaling_factor = sim_1_std * beta1
+        gaussian_map_norm = gaussian_map * scaling_factor + sim_1_mean
+        # print(f"gaussian_map_norm mean: {gaussian_map_norm.mean()}")
+        sim_token_1 = torch.clamp((1 - gamma) * sim_token_1 + gamma * gaussian_map_norm.squeeze(0), 0.0, 1.0)
 
-        # Efficient Gaussian blending for tokens 2 onwards with broadcasting
+        # Gaussian blending for tokens 2 onwards (with in-place operations)
         gaussian_map_exp = gaussian_map.expand_as(sim_tokens_rest)
-        # check if beta1 and beta2 are negative 
-        if beta1 < 0 and beta2 < 0:
-        # if beta1 == -1.0 and beta2 == -1.0:
-            sim_rest_mean = sim_tokens_rest.mean()
-            sim_rest_std = sim_tokens_rest.std()
-            gaussian_map_exp = (gaussian_map_exp - gaussian_map_exp.mean()) / (gaussian_map_exp.std() + 1e-5)
-            gaussian_map_exp = gaussian_map_exp * sim_rest_std + sim_rest_mean
-        sim_tokens_rest = torch.clamp((1 - beta2) * sim_tokens_rest + beta2 * gaussian_map_exp, 0.0, 1.0)
+        sim_rest_mean, sim_rest_std = sim_tokens_rest.mean(), sim_tokens_rest.std()
+        # print(f"sim_rest_mean: {sim_rest_mean}, sim_rest_std: {sim_rest_std}")
+        # gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
+        scaling_factor = sim_rest_std * beta2  # Adjust this multiplier as needed
+        gaussian_map_exp_norm = gaussian_map_exp * scaling_factor + sim_rest_mean
+        # print(f"gaussian_map_exp_norm mean: {gaussian_map_exp_norm.mean()}")
+        sim_tokens_rest = torch.clamp((1 - gamma) * sim_tokens_rest + gamma * gaussian_map_exp_norm, 0.0, 1.0)
 
-        # Apply attention weights across all tokens
+        # Apply attention weights (if provided) in-place
         if attn_weights is not None:
-            sim_tokens_rest = sim_tokens_rest * attn_weights.view(1, -1, 1, 1)
+            sim_tokens_rest.mul_(attn_weights.view(1, -1, 1, 1))
 
-        # Recombine token 1 and the rest
+        # Recombine token 1 and the rest in-place
         sim_target[:, 1, :, :] = sim_token_1
         sim_target[:, 2:, :, :] = sim_tokens_rest
 
-        # Downsample back to original size only if necessary
+        # Downsample to original size if necessary
         if target_size != map_size:
             sim_target = F.interpolate(sim_target, size=(map_size, map_size), mode='bilinear', align_corners=False)
 
-        # Reshape back to the original shape [num_heads, map_size * map_size, num_tokens]
+        # Reshape back to [num_heads, map_size * map_size, num_tokens]
         return sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
 
     def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None, attn_weights=None, beta1=1.0, beta2=0.1):
@@ -1714,20 +1711,13 @@ class DDIMSamplerWithGrad(object):
         #### ATTENTION GUIDANCE ####
         control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
         if control_attentions:
-            # num_tokens = 77
-            # a = torch.nn.Parameter(torch.rand(num_tokens - 2).to('cuda'))  # Create as a leaf tensor (Parameter) with random values between 0 and 1
             
             # Add a to kwargs
-            # kwargs['a_vector'] = a
-            # kwargs['optimizing'] = True
             target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
-            opt_steps = kwargs['optimization_steps']
             batch_idx = kwargs['batch_idx']
             logs_dir = kwargs['logs_dir']
             source_img = kwargs['source_img']
-            # lr = kwargs['lr']
-
-            # optimizer = torch.optim.Adam([a], lr=lr)
+            opt_steps = 1
             
             # Prefill the grid for normal images and prompt maps
             num_timesteps_to_display = 6  # For Timestep 50, 40, 30, 20, 10, 0
@@ -1746,35 +1736,27 @@ class DDIMSamplerWithGrad(object):
                     index = total_steps - i - 1
 
                     if 'control_attentions' in kwargs:
-                        if index < 20:
-                            # kwargs['control_attentions'] = False
-                            beta1 = -0.1
-                            beta2 = -0.1
+                        kwargs['control_attentions'] = True
+                        if index >= 45:
+                            beta1 = 5.0
+                            beta2 = 10.0
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
-                            # print('Setting control attentions to False')
-                        # else:
-                        #     # if index >= 30 and index < 45:
-                        #     #     beta1 = 1.0
-                        #     #     beta2 = 0.5
-                        #     # elif index > 45:
-                        #     #     beta1 = 1.0
-                        #     #     beta2 = 1.0
-                        #     # else:
-                        elif index < 45:
-                            beta1 = -1.0
-                            beta2 = -0.5
+                        elif index >= 25:
+                            beta1 = 20.0
+                            beta2 = 35.0
+                            kwargs['beta1'] = beta1
+                            kwargs['beta2'] = beta2
+                        elif index >= 15:
+                            beta1 = 20.0
+                            beta2 = 45.0
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
                         else:
                             beta1 = 1.0
-                            beta2 = 0.1
+                            beta2 = 1.0
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
-                            kwargs['control_attentions'] = True
-                            # kwargs['optimizing'] = True
-                            # print('Setting control attentions and optimizing back to True')
-                            
 
                     ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -1787,6 +1769,7 @@ class DDIMSamplerWithGrad(object):
                         assert len(ucg_schedule) == len(time_range)
                         unconditional_guidance_scale = ucg_schedule[i]
 
+                    start = time.time()
                     outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
                                             quantize_denoised=quantize_denoised, temperature=temperature,
                                             noise_dropout=noise_dropout, score_corrector=score_corrector,
@@ -1795,30 +1778,8 @@ class DDIMSamplerWithGrad(object):
                                             unconditional_conditioning=unconditional_conditioning,
                                             dynamic_threshold=dynamic_threshold, **kwargs)
                     img, pred_x0, attn_maps = outs
-                    
-                    # if kwargs['optimizing']:
-                    #     # get average attention maps from all layers
-                    #     avg_attn_maps = self.parse_attn_maps(attn_maps)
-                    #     # prompt_map = avg_attn_maps[:, :, 1]
-                    #     trailing_map = avg_attn_maps[:, :, 2:]
-                        
-                    #     avg_map = torch.mean(trailing_map, dim=2)
-                    #     # avg_map = torch.mean(avg_attn_maps[:, :, 1:], dim=2)
-                        
-                    #     # calculate loss
-                    #     loss = F.mse_loss(avg_map, target_map)
-                    #     loss.backward()
-                    #     optimizer.step()
-                        
-                    #     # update a vector
-                    #     a.data.clamp_(0, 1) # constrain between 0 and 1
-                    #     kwargs['a_vector'] = a
-                        
-                    #     wandb.log({'attn_guidance/loss': loss.item()})
-                    #     wandb.log({f'attn_guidance/a_{i}': a.tolist()[i] for i in tokens_to_display})
-                    #     # check if a has grad
-                    #     if a.grad is None:
-                    #         print('a has no grad')
+                    end = time.time()
+                    print(f"Time taken for timestep: {end - start}")
                     
                     # Check if `index` is in `timesteps_to_display`
                     if index in timesteps_to_display:
@@ -1844,10 +1805,7 @@ class DDIMSamplerWithGrad(object):
                     img = torch.randn(shape, device=device)
                 else:
                     img = x_T
-                # img.requires_grad = True
-                # kwargs['optimizing'] = True
                 kwargs['control_attentions'] = True
-                # print(f'Optimization step {opt_step} completed')
                 print('Setting control attentions back to True')
                 iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
@@ -1866,13 +1824,6 @@ class DDIMSamplerWithGrad(object):
             kwargs['optimizing'] = True
             for i, step in enumerate(iterator):
                     index = total_steps - i - 1
-                    
-                    # # if control_attentions in kwargs is True and index is less than 40, set control_attentions to False
-                    # if 'control_attentions' in kwargs:
-                    #     if kwargs['control_attentions'] and index < 40:
-                    #         kwargs['control_attentions'] = False
-                    #         print('Control attentions set to False')
-                    
                     ts = torch.full((b,), step, device=device, dtype=torch.long)
 
                     if mask is not None:

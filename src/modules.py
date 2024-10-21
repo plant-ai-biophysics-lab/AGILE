@@ -1739,11 +1739,11 @@ class DDIMSamplerWithGrad(object):
                         kwargs['control_attentions'] = True
                         if index >= 45:
                             beta1 = 5.0
-                            beta2 = 10.0
+                            beta2 = 15.0
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
                         elif index >= 25:
-                            beta1 = 20.0
+                            beta1 = 10.0
                             beta2 = 35.0
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2

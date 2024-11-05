@@ -3,6 +3,7 @@ import os
 import torch
 import wandb
 import random
+import ast
 import pytorch_lightning as pl
 
 from pathlib import Path
@@ -170,6 +171,9 @@ def main(args):
             resume=False
         )
         
+        # get beta pairs
+        betas = ast.literal_eval(args.betas)
+        
         # Initialize Attention Guidance
         attention_guidance = AttentionGuidance(
             prompt=prompt,
@@ -178,6 +182,7 @@ def main(args):
             ddim_steps=50,
             unconditional_guidance_scale=20.0,
             logs_dir=os.path.join(args.logs_dir, "attention_guidance"),
+            betas=betas
         )
         
         attention_guidance.train(dataloader_debug, num_epochs=args.optimize_epochs)
@@ -225,6 +230,8 @@ if __name__ == "__main__":
                     help="Strength of control.")
     ap.add_argument("--generate_images", action="store_true",
                     help="If set, final images will be generated at the end.")
+    ap.add_argument('--betas', type=str, required=True, 
+                    help="List of beta pairs, e.g., '[[50, 40], [50, 25], [50, 20]]'")
     args = ap.parse_args()
     
     main(args)

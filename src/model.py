@@ -2273,12 +2273,11 @@ class TextEmbeddingOptimizer:
             (timestep, attn_map_layers), = attn_map_step.items()
             if timestep == timestep_to_optimize:
                 all_maps_in_layer = []
-                # attn_map_layers = {key: attn_map_layers[key] for key in [8]} # TODO: only using layer 8 instead of avg
                 for _, (_, attn_map) in enumerate(attn_map_layers.items()):
                     for attn_type, values in attn_map[0].items():
                         if attn_type == self.att_type:
                             # keep only class token
-                            values = values[:, :, 1] # TODO: use the first token (grape)
+                            values = values[:, :, 1] # TODO: Try averaging across all the tokens
                             a_map = values.mean(dim=0)
                             map_size = int(math.sqrt(a_map.shape[-1]))
                             a_map = a_map.view(map_size, map_size)
@@ -2410,6 +2409,7 @@ class AttentionGuidance:
         batch_size,
         ddim_steps,
         unconditional_guidance_scale,
+        betas,
         logs_dir='control_logs',
         *args, **kwargs
     ):
@@ -2421,6 +2421,7 @@ class AttentionGuidance:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.logs_dir = logs_dir
         self.prompt = prompt
+        self.betas = betas
         
         if not os.path.exists(self.logs_dir):
             os.makedirs(self.logs_dir)
@@ -2467,4 +2468,5 @@ class AttentionGuidance:
                     batch_idx=batch_idx,
                     logs_dir=self.logs_dir,
                     source_img=batch['hint'],
+                    betas=self.betas
                 )

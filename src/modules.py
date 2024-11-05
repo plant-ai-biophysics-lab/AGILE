@@ -1717,6 +1717,7 @@ class DDIMSamplerWithGrad(object):
             batch_idx = kwargs['batch_idx']
             logs_dir = kwargs['logs_dir']
             source_img = kwargs['source_img']
+            betas = kwargs['betas']
             opt_steps = 1
             
             # Prefill the grid for normal images and prompt maps
@@ -1738,18 +1739,24 @@ class DDIMSamplerWithGrad(object):
                     if 'control_attentions' in kwargs:
                         kwargs['control_attentions'] = True
                         if index >= 40:
-                            beta1 = 50.0
-                            beta2 = 40.0
+                            # beta1 = 50.0
+                            beta1 = betas[0][0]
+                            # beta2 = 40.0
+                            beta2 = betas[0][1]
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
                         elif index >= 15:
-                            beta1 = 50.0
-                            beta2 = 25.0
+                            # beta1 = 50.0
+                            beta1 = betas[1][0]
+                            # beta2 = 25.0
+                            beta2 = betas[1][1]
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
                         else:
-                            beta1 = 50.0
-                            beta2 = 20.0
+                            # beta1 = 50.0
+                            beta1 = betas[2][0]
+                            # beta2 = 20.0
+                            beta2 = betas[2][1]
                             kwargs['beta1'] = beta1
                             kwargs['beta2'] = beta2
 

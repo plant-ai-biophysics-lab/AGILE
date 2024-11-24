@@ -23,7 +23,7 @@ from src.util import default, exists, extract_into_tensor, noise_like, zero_modu
 try:
     import xformers
     import xformers.ops
-    XFORMERS_IS_AVAILBLE = True
+    XFORMERS_IS_AVAILBLE = False
 except:
     XFORMERS_IS_AVAILBLE = False
     print("No module 'xformers'. Proceeding without it.")
@@ -508,127 +508,6 @@ class DiagonalGaussianDistribution(object):
     def mode(self):
         return self.mean
     
-class MemoryEfficientAttnBlock(nn.Module):
-    """
-        Uses xformers efficient implementation,
-        see https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
-        Note: this is a single-head self-attention operation
-    """
-    #
-    def __init__(self, in_channels):
-        super().__init__()
-        self.in_channels = in_channels
-
-        self.norm = Normalize(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.proj_out = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0)
-        self.attention_op: Optional[Any] = None
-
-    def forward(self, x):
-        h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        # compute attention
-        B, C, H, W = q.shape
-        q, k, v = map(lambda x: rearrange(x, 'b c h w -> b (h w) c'), (q, k, v))
-
-        q, k, v = map(
-            lambda t: t.unsqueeze(3)
-            .reshape(B, t.shape[1], 1, C)
-            .permute(0, 2, 1, 3)
-            .reshape(B * 1, t.shape[1], C)
-            .contiguous(),
-            (q, k, v),
-        )
-        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
-
-        out = (
-            out.unsqueeze(0)
-            .reshape(B, 1, out.shape[1], C)
-            .permute(0, 2, 1, 3)
-            .reshape(B, out.shape[1], C)
-        )
-        out = rearrange(out, 'b (h w) c -> b c h w', b=B, h=H, w=W, c=C)
-        out = self.proj_out(out)
-        return x+out
-
-class MemoryEfficientCrossAttention(nn.Module):
-    # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
-        super().__init__()
-        print(f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
-              f"{heads} heads.")
-        inner_dim = dim_head * heads
-        context_dim = default(context_dim, query_dim)
-
-        self.heads = heads
-        self.dim_head = dim_head
-
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
-        self.attention_op: Optional[Any] = None
-
-    def forward(self, x, context=None, mask=None):
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-
-        b, _, _ = q.shape
-        q, k, v = map(
-            lambda t: t.unsqueeze(3)
-            .reshape(b, t.shape[1], self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .reshape(b * self.heads, t.shape[1], self.dim_head)
-            .contiguous(),
-            (q, k, v),
-        )
-
-        # actually compute the attention, what we cannot get enough of
-        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
-
-        if exists(mask):
-            raise NotImplementedError
-        out = (
-            out.unsqueeze(0)
-            .reshape(b, self.heads, out.shape[1], self.dim_head)
-            .permute(0, 2, 1, 3)
-            .reshape(b, out.shape[1], self.heads * self.dim_head)
-        )
-        return self.to_out(out)
-
-class MemoryEfficientCrossAttentionWrapper(MemoryEfficientCrossAttention):
-    def forward(self, x, context=None, mask=None):
-        b, c, h, w = x.shape
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        out = super().forward(x, context=context, mask=mask)
-        out = rearrange(out, 'b (h w) c -> b c h w', h=h, w=w, c=c)
-        return x + out
-    
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
@@ -666,59 +545,6 @@ class Downsample(nn.Module):
         else:
             x = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
         return x
-    
-class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.in_channels = in_channels
-
-        self.norm = Normalize(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.proj_out = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0)
-
-    def forward(self, x):
-        h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        # compute attention
-        b,c,h,w = q.shape
-        q = q.reshape(b,c,h*w)
-        q = q.permute(0,2,1)   # b,hw,c
-        k = k.reshape(b,c,h*w) # b,c,hw
-        w_ = torch.bmm(q,k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
-
-        # attend to values
-        v = v.reshape(b,c,h*w)
-        w_ = w_.permute(0,2,1)   # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(v,w_)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = h_.reshape(b,c,h,w)
-
-        h_ = self.proj_out(h_)
-
-        return x+h_
     
 class ResnetBlock(nn.Module):
     def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False,
@@ -983,6 +809,303 @@ class Decoder(nn.Module):
             h = torch.tanh(h)
         return h
 
+class MemoryEfficientAttnBlock(nn.Module):
+    """
+        Uses xformers efficient implementation,
+        see https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
+        Note: this is a single-head self-attention operation
+    """
+    #
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+
+        self.norm = Normalize(in_channels)
+        self.q = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.k = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.v = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.proj_out = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0)
+        self.attention_op: Optional[Any] = None
+
+    def forward(self, x):
+        h_ = x
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+
+        # compute attention
+        B, C, H, W = q.shape
+        q, k, v = map(lambda x: rearrange(x, 'b c h w -> b (h w) c'), (q, k, v))
+
+        q, k, v = map(
+            lambda t: t.unsqueeze(3)
+            .reshape(B, t.shape[1], 1, C)
+            .permute(0, 2, 1, 3)
+            .reshape(B * 1, t.shape[1], C)
+            .contiguous(),
+            (q, k, v),
+        )
+        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
+
+        out = (
+            out.unsqueeze(0)
+            .reshape(B, 1, out.shape[1], C)
+            .permute(0, 2, 1, 3)
+            .reshape(B, out.shape[1], C)
+        )
+        out = rearrange(out, 'b (h w) c -> b c h w', b=B, h=H, w=W, c=C)
+        out = self.proj_out(out)
+        return x + out
+    
+class MemoryEfficientCrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        print(f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
+              f"{heads} heads.")
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.attention_op: Optional[Any] = None
+
+    def apply_attention_edit(self, sim_target, gaussian_map, beta1=1.0, beta2=1.0, attn_weights=None, gamma=1.0):
+        # Extract sizes and precompute constants
+        target_size = gaussian_map.shape[-1]
+        map_size = int(math.sqrt(sim_target.shape[1]))
+        num_heads, num_tokens = sim_target.shape[0], sim_target.shape[2]
+
+        # Reshape sim_target to [num_heads, num_tokens, map_size, map_size] directly
+        sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
+
+        # Upsample sim_target only if necessary
+        if map_size != target_size:
+            sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
+
+        # Split token 1 and the rest
+        sim_token_1 = sim_target[:, 1:2, :, :]  # Keep as a single-channel tensor
+        sim_tokens_rest = sim_target[:, 2:, :, :]
+
+        # Compute statistics for token 1 in-place
+        sim_1_mean = sim_token_1.mean()
+        sim_1_std = sim_token_1.std()
+        gaussian_map_norm = gaussian_map * (sim_1_std * beta1) + sim_1_mean
+        sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
+
+        # Compute optimized Gaussian blending for tokens 2 onwards
+        selected_mean = sim_tokens_rest.mean()
+        selected_std = sim_tokens_rest.std()
+        gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
+        sim_tokens_rest.mul_(1 - gamma).add_(gamma * gaussian_map_exp_norm).clamp_(0.0, 1.0)
+
+        # Reapply attention weights if provided
+        if attn_weights is not None:
+            sim_tokens_rest.mul_(attn_weights.view(1, -1, 1, 1))
+
+        # Combine token 1 and the rest
+        sim_target[:, 1:2, :, :] = sim_token_1
+        sim_target[:, 2:, :, :] = sim_tokens_rest
+
+        # Downsample to original size if needed
+        if target_size != map_size:
+            sim_target = F.interpolate(sim_target, size=(map_size, map_size), mode='bilinear', align_corners=False)
+
+        # Reshape back to [num_heads, map_size * map_size, num_tokens]
+        return sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
+
+    def forward(self, x, context=None, mask=None, return_attn_weights=False, optimize=False, control_attentions=False, gaussian_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
+        b, n, _ = x.shape
+        h = self.heads
+
+        if optimize:
+            with torch.enable_grad():  # Enable gradient computation for optimization
+                
+                # Prepare queries, keys, values
+                q = self.to_q(x)
+                context = default(context, x)
+                k = self.to_k(context)
+                v = self.to_v(context)
+
+                q, k, v = map(
+                    lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
+                    (q, k, v),
+                )
+                
+                sim = xformers.ops.memory_efficient_attention(
+                    q, k, v, attn_bias=None, op=self.attention_op
+                )
+                if control_attentions:
+                    sim = self.apply_attention_edit(
+                        sim, gaussian_map, beta1=beta1, beta2=beta2, attn_weights=attn_weights
+                    )
+        else:
+            # Prepare queries, keys, values
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+
+            q, k, v = map(
+                lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
+                (q, k, v),
+            )
+            
+            sim = xformers.ops.memory_efficient_attention(
+                q, k, v, attn_bias=None, op=self.attention_op
+            )
+            if control_attentions:
+                sim = self.apply_attention_edit(
+                    sim, gaussian_map, beta1=beta1, beta2=beta2, attn_weights=attn_weights
+                )
+
+        # Reshape back to original dimensions
+        out = (
+            sim.unsqueeze(0)
+            .reshape(b, h, sim.shape[1], self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b, sim.shape[1], h * self.dim_head)
+        )
+        out = self.to_out(out)
+
+        if return_attn_weights:
+            return out, sim
+        else:
+            return out
+
+class MemoryEfficientCrossAttentionWrapper(MemoryEfficientCrossAttention):
+    def forward(self, x, context=None, mask=None, return_attn_weights=False, optimize=False, control_attentions=False, gaussian_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
+        # Reshape input from (B, C, H, W) to (B, H*W, C)
+        b, c, h, w = x.shape
+
+        if optimize:
+            with torch.enable_grad():  # Enable gradient computation for optimization
+                
+                x = rearrange(x, 'b c h w -> b (h w) c')
+
+                h_heads = self.heads
+
+                # Prepare queries, keys, and values
+                q = self.to_q(x)
+                context = default(context, x)
+                k = self.to_k(context)
+                v = self.to_v(context)
+                q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h_heads), (q, k, v))
+                
+                sim = xformers.ops.memory_efficient_attention(
+                    q, k, v, attn_bias=None, op=self.attention_op
+                )
+                if control_attentions:
+                    sim = self.apply_attention_edit(
+                        sim, gaussian_map, beta1=beta1, beta2=beta2, attn_weights=attn_weights
+                    )
+        else:
+            x = rearrange(x, 'b c h w -> b (h w) c')
+
+            h_heads = self.heads
+
+            # Prepare queries, keys, and values
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h_heads), (q, k, v))
+            
+            sim = xformers.ops.memory_efficient_attention(
+                q, k, v, attn_bias=None, op=self.attention_op
+            )
+            if control_attentions:
+                sim = self.apply_attention_edit(
+                    sim, gaussian_map, beta1=beta1, beta2=beta2, attn_weights=attn_weights
+                )
+
+        # Reshape attention output back to the original format
+        sim = rearrange(sim, '(b h) n d -> b n (h d)', h=h_heads)
+        out = self.to_out(sim)
+
+        # Reshape output back to (B, C, H, W)
+        out = rearrange(out, 'b (h w) c -> b c h w', h=h, w=w, c=c)
+
+        if return_attn_weights:
+            return out, sim
+        else:
+            return out
+    
+class AttnBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+
+        self.norm = Normalize(in_channels)
+        self.q = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.k = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.v = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.proj_out = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0)
+
+    def forward(self, x):
+        h_ = x
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+
+        # compute attention
+        b,c,h,w = q.shape
+        q = q.reshape(b,c,h*w)
+        q = q.permute(0,2,1)   # b,hw,c
+        k = k.reshape(b,c,h*w) # b,c,hw
+        w_ = torch.bmm(q,k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+        w_ = w_ * (int(c)**(-0.5))
+        w_ = torch.nn.functional.softmax(w_, dim=2)
+
+        # attend to values
+        v = v.reshape(b,c,h*w)
+        w_ = w_.permute(0,2,1)   # b,hw,hw (first hw of k, second of q)
+        h_ = torch.bmm(v,w_)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        h_ = h_.reshape(b,c,h,w)
+
+        h_ = self.proj_out(h_)
+
+        return x+h_
+
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
         super().__init__()
@@ -1005,50 +1128,55 @@ class CrossAttention(nn.Module):
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
     def apply_attention_edit(self, sim_target, gaussian_map, beta1=1.0, beta2=1.0, attn_weights=None, gamma=1.0):
-        # Extract necessary sizes
+        # Extract sizes and precompute constants
         target_size = gaussian_map.shape[-1]
         map_size = int(math.sqrt(sim_target.shape[1]))
         num_heads, num_tokens = sim_target.shape[0], sim_target.shape[2]
 
-        # Reshape sim_target to [num_heads, map_size, map_size, num_tokens] directly
+        # Reshape sim_target to [num_heads, num_tokens, map_size, map_size] directly
         sim_target = sim_target.view(num_heads, map_size, map_size, num_tokens).permute(0, 3, 1, 2)
 
-        # Only upsample sim_target if needed
+        # Upsample sim_target only if necessary
         if map_size != target_size:
             sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
         # Split token 1 and the rest
-        sim_token_1 = sim_target[:, 1, :, :]
+        sim_token_1 = sim_target[:, 1:2, :, :]  # Keep as a single-channel tensor
         sim_tokens_rest = sim_target[:, 2:, :, :]
 
-        # Gaussian blending for token 1 (in-place when possible)
-        sim_1_mean, sim_1_std = sim_token_1.mean(), sim_token_1.std()
-        # print(f"sim_1_mean: {sim_1_mean}, sim_1_std: {sim_1_std}")
-        # gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
-        scaling_factor = sim_1_std * beta1
-        gaussian_map_norm = gaussian_map * scaling_factor + sim_1_mean
-        # print(f"gaussian_map_norm mean: {gaussian_map_norm.mean()}")
-        sim_token_1 = torch.clamp((1 - gamma) * sim_token_1 + gamma * gaussian_map_norm.squeeze(0), 0.0, 1.0)
+        # Compute statistics for token 1 in-place
+        sim_1_mean = sim_token_1.mean()
+        sim_1_std = sim_token_1.std()
+        gaussian_map_norm = gaussian_map * (sim_1_std * beta1) + sim_1_mean
+        sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
 
-        # Gaussian blending for tokens 2 onwards (with in-place operations)
-        gaussian_map_exp = gaussian_map.expand_as(sim_tokens_rest)
-        sim_rest_mean, sim_rest_std = sim_tokens_rest.mean(), sim_tokens_rest.std()
-        # print(f"sim_rest_mean: {sim_rest_mean}, sim_rest_std: {sim_rest_std}")
-        # gaussian_map = (gaussian_map - gaussian_map.mean()) / (gaussian_map.std() + 1e-5)
-        scaling_factor = sim_rest_std * beta2  # Adjust this multiplier as needed
-        gaussian_map_exp_norm = gaussian_map_exp * scaling_factor + sim_rest_mean
-        # print(f"gaussian_map_exp_norm mean: {gaussian_map_exp_norm.mean()}")
-        sim_tokens_rest = torch.clamp((1 - gamma) * sim_tokens_rest + gamma * gaussian_map_exp_norm, 0.0, 1.0)
+        # Compute optimized Gaussian blending for tokens 2 onwards
+        # selected_tokens = sim_tokens_rest[:, ::5, :, :]  # Sample every 5th token
+        # selected_mean = selected_tokens.mean()
+        # selected_std = selected_tokens.std()
+        # gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
+        # selected_tokens.mul_(1 - gamma).add_(gamma * gaussian_map_exp_norm).clamp_(0.0, 1.0)
+        # Compute optimized Gaussian blending for every 5th token
+        indices = torch.arange(sim_tokens_rest.shape[1]) % 5 == 0  # Select every 5th token
+        selected_tokens = sim_tokens_rest[:, indices, :, :]  # Filter out every 5th token
+        selected_mean = selected_tokens.mean()
+        selected_std = selected_tokens.std()
+        gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
+        selected_tokens = selected_tokens * (1 - gamma) + gamma * gaussian_map_exp_norm
+        selected_tokens = selected_tokens.clamp(0.0, 1.0)
 
-        # Apply attention weights (if provided) in-place
+        # Update only every 5th token in sim_tokens_rest
+        sim_tokens_rest[:, indices, :, :] = selected_tokens
+
+        # Reapply attention weights if provided
         if attn_weights is not None:
             sim_tokens_rest.mul_(attn_weights.view(1, -1, 1, 1))
 
-        # Recombine token 1 and the rest in-place
-        sim_target[:, 1, :, :] = sim_token_1
+        # Combine token 1 and the rest
+        sim_target[:, 1:2, :, :] = sim_token_1
         sim_target[:, 2:, :, :] = sim_tokens_rest
 
-        # Downsample to original size if necessary
+        # Downsample to original size if needed
         if target_size != map_size:
             sim_target = F.interpolate(sim_target, size=(map_size, map_size), mode='bilinear', align_corners=False)
 
@@ -1056,25 +1184,28 @@ class CrossAttention(nn.Module):
         return sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
 
     def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None, attn_weights=None, beta1=1.0, beta2=0.1):
-        if self._ATTN_PRECISION == "fp32":
-            with torch.autocast(enabled=False, device_type='cuda'):
+        is_fp32 = self._ATTN_PRECISION == "fp32"
+
+        with torch.autocast(enabled=not is_fp32, device_type='cuda'):
+            if is_fp32:
                 q, k = q.float(), k.float()
-                sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-                sim = sim.softmax(dim=-1)
-                if control_attentions:
-                    sim = self.apply_attention_edit(sim, gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
-        else:
+
+            # Compute scaled dot-product attention
             sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
             sim = sim.softmax(dim=-1)
+
+            # Apply attention edits if necessary
             if control_attentions:
                 sim = self.apply_attention_edit(sim, gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
 
+        # Apply mask if provided
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
             max_neg_value = -torch.finfo(sim.dtype).max
             mask = repeat(mask, 'b j -> (b h) () j', h=self.heads)
             sim.masked_fill_(~mask, max_neg_value)
-        
+
+        # Compute attention output
         out = torch.einsum('b i j, b j d -> b i d', sim, v)
         
         return out, sim
@@ -1125,7 +1256,7 @@ class CrossAttention(nn.Module):
         if return_attn_weights:
             return out, sim
         else:
-            return out  
+            return out
 
 class GEGLU(nn.Module):
     def __init__(self, dim_in, dim_out):
@@ -1175,7 +1306,7 @@ class BasicTransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
-        self.checkpoint = checkpoint
+        self.checkpoint = False
 
     def forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
         # return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
@@ -1203,8 +1334,10 @@ class BasicTransformerBlock(nn.Module):
             # self.attn_maps['attn1'] = attn1_weights  # Store the attention weights
             x = attn1_output + x  # Update x with the output of attn1
 
-            attn2_output, attn2_weights = self.attn2(self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, 
-                                                     control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights)
+            attn2_output, attn2_weights = self.attn2(
+                self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions,
+                gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+            )
             attn_maps = {'attn2': attn2_weights}
             x = attn2_output + x  # Update x with the output of attn2
 
@@ -1713,114 +1846,111 @@ class DDIMSamplerWithGrad(object):
         if control_attentions:
             
             # Add a to kwargs
-            target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
-            batch_idx = kwargs['batch_idx']
-            logs_dir = kwargs['logs_dir']
-            source_img = kwargs['source_img']
+            # target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
+            # batch_idx = kwargs['batch_idx']
+            # logs_dir = kwargs['logs_dir']
+            # source_img = kwargs['source_img']
             betas = kwargs['betas']
-            opt_steps = 1
+            # opt_steps = 1
             
             # Prefill the grid for normal images and prompt maps
-            num_timesteps_to_display = 6  # For Timestep 50, 40, 30, 20, 10, 0
-            grid_images = [[None for _ in range(num_timesteps_to_display + 1)] for _ in range(opt_steps)]  # +1 for source_img
+            # num_timesteps_to_display = 6  # For Timestep 50, 40, 30, 20, 10, 0
+            # grid_images = [[None for _ in range(num_timesteps_to_display + 1)] for _ in range(opt_steps)]  # +1 for source_img
             
             # Prefill the grid for prompt maps with timesteps in columns and rows are tokens [1, 5, 10, 30, 50, 70]
-            tokens_to_display = [1, 5, 10, 30, 50, 70]
-            prompt_map_grid = [[None for _ in range(num_timesteps_to_display)] for _ in range(len(tokens_to_display))]  # +1 for target_map
+            # tokens_to_display = [1, 5, 10, 30, 50, 70]
+            # prompt_map_grid = [[None for _ in range(num_timesteps_to_display)] for _ in range(len(tokens_to_display))]  # +1 for target_map
             
             # Timesteps to display (every 10th step, starting from 50)
-            timesteps_to_display = [49, 40, 30, 20, 10, 0]
+            # timesteps_to_display = [49, 40, 30, 20, 10, 0]
             
-            for opt_step in range(opt_steps):
-                for i, step in enumerate(iterator):
+            # for opt_step in range(opt_steps):
+            for i, step in enumerate(iterator):
 
-                    index = total_steps - i - 1
+                index = total_steps - i - 1
 
-                    if 'control_attentions' in kwargs:
-                        kwargs['control_attentions'] = True
-                        if index >= 40:
-                            # beta1 = 50.0
-                            beta1 = betas[0][0]
-                            # beta2 = 40.0
-                            beta2 = betas[0][1]
-                            kwargs['beta1'] = beta1
-                            kwargs['beta2'] = beta2
-                        elif index >= 15:
-                            # beta1 = 50.0
-                            beta1 = betas[1][0]
-                            # beta2 = 25.0
-                            beta2 = betas[1][1]
-                            kwargs['beta1'] = beta1
-                            kwargs['beta2'] = beta2
-                        else:
-                            # beta1 = 50.0
-                            beta1 = betas[2][0]
-                            # beta2 = 20.0
-                            beta2 = betas[2][1]
-                            kwargs['beta1'] = beta1
-                            kwargs['beta2'] = beta2
+                if 'control_attentions' in kwargs:
+                    kwargs['control_attentions'] = True
+                    if index >= 40:
+                        beta1 = betas[0][0]
+                        beta2 = betas[0][1]
+                        kwargs['beta1'] = beta1
+                        kwargs['beta2'] = beta2
+                    elif index >= 15:
+                        beta1 = betas[1][0]
+                        beta2 = betas[1][1]
+                        kwargs['beta1'] = beta1
+                        kwargs['beta2'] = beta2
+                    else:
+                        beta1 = betas[2][0]
+                        beta2 = betas[2][1]
+                        kwargs['beta1'] = beta1
+                        kwargs['beta2'] = beta2
 
-                    ts = torch.full((b,), step, device=device, dtype=torch.long)
+                ts = torch.full((b,), step, device=device, dtype=torch.long)
 
-                    if mask is not None:
-                        assert x0 is not None
-                        img_orig = self.model.q_sample(x0, ts)
-                        img = img_orig * mask + (1. - mask) * img
+                if mask is not None:
+                    assert x0 is not None
+                    img_orig = self.model.q_sample(x0, ts)
+                    img = img_orig * mask + (1. - mask) * img
 
-                    if ucg_schedule is not None:
-                        assert len(ucg_schedule) == len(time_range)
-                        unconditional_guidance_scale = ucg_schedule[i]
+                if ucg_schedule is not None:
+                    assert len(ucg_schedule) == len(time_range)
+                    unconditional_guidance_scale = ucg_schedule[i]
 
-                    start = time.time()
-                    outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
-                                            quantize_denoised=quantize_denoised, temperature=temperature,
-                                            noise_dropout=noise_dropout, score_corrector=score_corrector,
-                                            corrector_kwargs=corrector_kwargs,
-                                            unconditional_guidance_scale=unconditional_guidance_scale,
-                                            unconditional_conditioning=unconditional_conditioning,
-                                            dynamic_threshold=dynamic_threshold, **kwargs)
-                    img, pred_x0, attn_maps = outs
-                    end = time.time()
-                    print(f"Time taken for timestep: {end - start}")
+                outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
+                                        quantize_denoised=quantize_denoised, temperature=temperature,
+                                        noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                        corrector_kwargs=corrector_kwargs,
+                                        unconditional_guidance_scale=unconditional_guidance_scale,
+                                        unconditional_conditioning=unconditional_conditioning,
+                                        dynamic_threshold=dynamic_threshold, **kwargs)
+                img, pred_x0, attn_maps = outs
                     
-                    # Check if `index` is in `timesteps_to_display`
-                    if index in timesteps_to_display:
-                        timestep_index = timesteps_to_display.index(index)
-                        img_decoded = self.model.decode_first_stage(img)
-                        grid_images[opt_step][timestep_index] = img_decoded  # Store in prefilled grid for selected timesteps
+                # ### NOTE FOR DEBUGGING NOTE ###
+                #     # Check if `index` is in `timesteps_to_display`
+                #     if index in timesteps_to_display:
+                #         timestep_index = timesteps_to_display.index(index)
+                #         img_decoded = self.model.decode_first_stage(img)
+                #         grid_images[opt_step][timestep_index] = img_decoded  # Store in prefilled grid for selected timesteps
                         
-                        # Save the corresponding `prompt_map` in the prompt_map_grid if in last opt_step
-                        if opt_step == opt_steps - 1:
+                #         # Save the corresponding `prompt_map` in the prompt_map_grid if in last opt_step
+                #         if opt_step == opt_steps - 1:
                             
-                            # get tokens to display from avg_attn_maps
-                            display_avg_attn_maps = self.parse_attn_maps(attn_maps)
-                            tokens_to_display_avg = display_avg_attn_maps[:, :, tokens_to_display]
-                            for i, _ in enumerate(tokens_to_display):
-                                token_colored = self.apply_viridis_colormap(tokens_to_display_avg[:, :, i])
-                                prompt_map_grid[i][timestep_index] = token_colored
+                #             # get tokens to display from avg_attn_maps
+                #             display_avg_attn_maps = self.parse_attn_maps(attn_maps)
+                #             tokens_to_display_avg = display_avg_attn_maps[:, :, tokens_to_display]
+                #             for i, _ in enumerate(tokens_to_display):
+                #                 token_colored = self.apply_viridis_colormap(tokens_to_display_avg[:, :, i])
+                #                 prompt_map_grid[i][timestep_index] = token_colored
                     
-                # Add source_img and target_map at the end of each row
-                grid_images[opt_step][-1] = source_img.squeeze(0).permute(2, 0, 1)  # Add source image at the end of the row in the normal grid
+                # # Add source_img and target_map at the end of each row
+                # grid_images[opt_step][-1] = source_img.squeeze(0).permute(2, 0, 1)  # Add source image at the end of the row in the normal grid
+                # ### NOTE FOR DEBUGGING NOTE ###
                 
-                # Reset img
-                if x_T is None:
-                    img = torch.randn(shape, device=device)
-                else:
-                    img = x_T
-                kwargs['control_attentions'] = True
-                print('Setting control attentions back to True')
-                iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+                # ### NOTE FOR DEBUGGING NOTE ###
+                # # Reset img
+                # if x_T is None:
+                #     img = torch.randn(shape, device=device)
+                # else:
+                #     img = x_T
+                # kwargs['control_attentions'] = True
+                # print('Setting control attentions back to True')
+                # iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+                # ### NOTE FOR DEBUGGING NOTE ###
 
-            # Generate the image grid from the prefilled array for both normal images and prompt maps
-            opt_step_titles = [f'Step {i + 1}' for i in range(opt_steps)]  # Row titles
+            #  ### NOTE FOR DEBUGGING NOTE ###
+            # # Generate the image grid from the prefilled array for both normal images and prompt maps
+            # opt_step_titles = [f'Step {i + 1}' for i in range(opt_steps)]  # Row titles
             
-             # Save normal image grid
-            rgb_img_dir = os.path.join(logs_dir, 'rgb_images')
-            self.create_image_grid_prefilled(grid_images, opt_steps, num_timesteps_to_display + 1, rgb_img_dir, timesteps_to_display + ["Source"], opt_step_titles, batch_idx=batch_idx, target_map=target_map, final_img=None)
+            #  # Save normal image grid
+            # rgb_img_dir = os.path.join(logs_dir, 'rgb_images')
+            # self.create_image_grid_prefilled(grid_images, opt_steps, num_timesteps_to_display + 1, rgb_img_dir, timesteps_to_display + ["Source"], opt_step_titles, batch_idx=batch_idx, target_map=target_map, final_img=None)
             
-            # Save prompt map grid
-            attn_map_dir = os.path.join(logs_dir, 'attn_maps')
-            self.create_prompt_map_grid_prefilled(prompt_map_grid, len(tokens_to_display), num_timesteps_to_display, attn_map_dir, timesteps_to_display, tokens_to_display, batch_idx)
+            # # Save prompt map grid
+            # attn_map_dir = os.path.join(logs_dir, 'attn_maps')
+            # self.create_prompt_map_grid_prefilled(prompt_map_grid, len(tokens_to_display), num_timesteps_to_display, attn_map_dir, timesteps_to_display, tokens_to_display, batch_idx)
+            #  ### NOTE FOR DEBUGGING NOTE ###
             
         else:
             kwargs['optimizing'] = True
@@ -1897,7 +2027,7 @@ class DDIMSamplerWithGrad(object):
         def forward_model(x_in, t_in, c_in):
             if control_attentions:
                 return self.model.apply_model(x_in, t_in, c_in, 
-                            save_attention=True, optimizing=True, control_attentions=True, gaussian_map=gaussian_map, attn_weights=a_vector, beta1=beta1, beta2=beta2
+                            save_attention=True, optimizing=False, control_attentions=True, gaussian_map=gaussian_map, attn_weights=a_vector, beta1=beta1, beta2=beta2
                         )
             return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=optimizing)
 

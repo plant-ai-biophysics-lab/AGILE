@@ -2232,6 +2232,7 @@ class TextEmbeddingOptimizer:
         batch_size,
         lr,
         ddim_steps,
+        image_size,
         unconditional_guidance_scale,
         timestep_to_optimize='timestep_30', # TODO: Try optimizing at an earlier timestep
         logs_dir='optimize_logs',
@@ -2258,7 +2259,7 @@ class TextEmbeddingOptimizer:
         # For optimization parameters
         self.timestep_to_optimize = timestep_to_optimize
         self.att_type = 'attn2'
-        self.target_size = (512, 512)
+        self.target_size = (image_size, image_size)
         self.opt_steps = optimization_steps
 
         # Loss function
@@ -2298,7 +2299,7 @@ class TextEmbeddingOptimizer:
 
         return all_maps_in_layer
 
-    def train(self, dataloader, num_epochs):
+    def train(self, dataloader, num_epochs=1):
         # if prompt is tensor, skip encoding
         if isinstance(self.prompt, torch.Tensor):
             print("Using optimized embedding!")
@@ -2431,7 +2432,7 @@ class AttentionGuidance:
         # clear torch cache
         torch.cuda.empty_cache()
 
-    def train(self, dataloader, num_epochs):
+    def train(self, dataloader, original_size, num_epochs=1):
         
         # get prompt embedding
         if isinstance(self.prompt, torch.Tensor):
@@ -2457,7 +2458,7 @@ class AttentionGuidance:
                 gaussian_map = batch['attn_map'].squeeze(0).to(self.device)
                 
                 # Sample generation and attention maps
-                generated, intermediates = self.model.sample_log_with_grad(
+                generated, _ = self.model.sample_log_with_grad(
                     cond={"c_concat": [c_cat], "c_crossattn": [text_embedding]},
                     batch_size=N, ddim=use_ddim,
                     ddim_steps=self.ddim_steps,
@@ -2470,3 +2471,15 @@ class AttentionGuidance:
                     source_img=batch['hint'],
                     betas=self.betas
                 )
+                
+                generated = self.model.decode_first_stage(generated)
+                
+                # interpolate generated image to original size
+                generated = nn.functional.interpolate(generated, size=original_size, mode='bilinear', align_corners=False)
+                generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+                generated = (generated - generated.min()) / (generated.max() - generated.min())
+                generated = (generated * 255).astype(np.uint8)
+                
+                # save generated image (will only work for batch size of 1)
+                file_name = f"{self.logs_dir}/{os.path.basename(batch['source_path'][0])}"
+                plt.imsave(file_name, generated)

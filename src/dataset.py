@@ -30,6 +30,10 @@ class ControlNetDataset(Dataset):
                 'prompt': self.prompt,
                 'control': None # placeholder for control
             })
+            
+        # get original source image size
+        source_image = Image.open(os.path.join(self.source_images_path, self.source_image_files[0])).convert("RGB")
+        self.source_image_size = source_image.size
     
     def balance_dataset_lengths(self):
         if len(self.source_image_files) < len(self.target_image_files):
@@ -96,14 +100,6 @@ class ControlNetDataset(Dataset):
         
         # Convert to PIL image
         attention_map = Image.fromarray((attention_map * 255).astype(np.uint8))
-        
-        # # Save the VIRIDIS colormap version for debugging
-        # import matplotlib.pyplot as plt
-        # import matplotlib.cm as cm
-        # plt.imshow(attention_map, cmap=cm.viridis)
-        # plt.axis('off')  # Hide axes
-        # plt.savefig("attention_map_viridis_debug.png", bbox_inches='tight', pad_inches=0)
-        # plt.close()
         
         return attention_map
     

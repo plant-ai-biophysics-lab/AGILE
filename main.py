@@ -60,7 +60,7 @@ def main(args):
     
     # prepare dataset and dataloader
     transform = transforms.Compose([
-        transforms.Resize((512, 512)),
+        transforms.Resize((args.image_size, args.image_size)),
         PermuteTransform()
     ])
     dataset = ControlNetDataset(
@@ -77,30 +77,30 @@ def main(args):
         shuffle=True
     )
     
-    # logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
-    # logger.train_dataloader = dataloader
+    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
+    logger.train_dataloader = dataloader
     
-    # # prepare wandb logger
-    # wandb_logger = WandbLogger(
-    #     entity='paibl',
-    #     project='controlnet',
-    #     name=f"{args.logs_dir.name}_initial_training",
-    #     save_dir=args.logs_dir,
-    # )
+    # prepare wandb logger
+    wandb_logger = WandbLogger(
+        entity='paibl',
+        project='controlnet',
+        name=f"{args.logs_dir.name}_initial_training",
+        save_dir=args.logs_dir,
+    )
     
-    # # start training
-    # trainer = pl.Trainer(
-    #     max_epochs=args.epochs,
-    #     default_root_dir=args.logs_dir,
-    #     precision = 32,
-    #     callbacks = [logger],
-    #     logger=wandb_logger,
-    #     accumulate_grad_batches=args.batch_size*4,
-    # )
-    # trainer.fit(model, dataloader)
+    # start training
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        default_root_dir=args.logs_dir,
+        precision = 32,
+        callbacks = [logger],
+        logger=wandb_logger,
+        accumulate_grad_batches=args.batch_size*4,
+    )
+    trainer.fit(model, dataloader)
     
-    # # end wandb
-    # wandb.finish()
+    # end wandb
+    wandb.finish()
     
     #######################################################
     ############### EMBEDDING OPTIMIZATION ################
@@ -125,6 +125,7 @@ def main(args):
             batch_size=args.batch_size,
             lr=0.01,
             ddim_steps=50,
+            image_size=args.image_size,
             unconditional_guidance_scale=20.0,
             logs_dir=os.path.join(args.logs_dir, "text_optimizer"),
             optimization_steps=args.optimize_steps
@@ -154,13 +155,13 @@ def main(args):
         
         # TODO: REMOVE THIS DEBUG AFTER DRAFT RUNS
         # reduce dataset size to 5 for debugging
-        dataset = Subset(dataset, random.sample(range(len(dataset)), 5))
-        dataloader_debug = DataLoader(
-            dataset,
-            num_workers=0,
-            batch_size=args.batch_size,
-            shuffle=True
-        )
+        # sub_dataset = Subset(dataset, random.sample(range(len(dataset)), 5))
+        # dataloader_debug = DataLoader(
+        #     sub_dataset,
+        #     num_workers=0,
+        #     batch_size=args.batch_size,
+        #     shuffle=True
+        # )
         
         # Set up the Wandb logger for embedding optimization
         wandb.init(
@@ -185,7 +186,7 @@ def main(args):
             betas=betas
         )
         
-        attention_guidance.train(dataloader_debug, num_epochs=args.optimize_epochs)
+        attention_guidance.train(dataloader, original_size=dataset.source_image_size)
 
 if __name__ == "__main__":
     
@@ -206,6 +207,8 @@ if __name__ == "__main__":
                     help="Path to target images.")
     ap.add_argument("--batch_size", type=int, default=1,
                     help="Batch size for training.")
+    ap.add_argument("--image_size", type=int, default=512,
+                    help="Input image size.")
     ap.add_argument("--logger_freq", type=int, default=1,
                     help="Logging frequency.")
     ap.add_argument("--epochs", type=int, default=100,
@@ -230,7 +233,7 @@ if __name__ == "__main__":
                     help="Strength of control.")
     ap.add_argument("--generate_images", action="store_true",
                     help="If set, final images will be generated at the end.")
-    ap.add_argument('--betas', type=str, required=True, 
+    ap.add_argument('--betas', type=str, default='[[50, 40], [50, 25], [50, 20]]', 
                     help="List of beta pairs, e.g., '[[50, 40], [50, 25], [50, 20]]'")
     args = ap.parse_args()
     

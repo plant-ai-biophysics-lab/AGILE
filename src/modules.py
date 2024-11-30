@@ -1150,15 +1150,9 @@ class CrossAttention(nn.Module):
         gaussian_map_norm = gaussian_map * (sim_1_std * beta1) + sim_1_mean
         sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
 
-        # Compute optimized Gaussian blending for tokens 2 onwards
-        # selected_tokens = sim_tokens_rest[:, ::5, :, :]  # Sample every 5th token
-        # selected_mean = selected_tokens.mean()
-        # selected_std = selected_tokens.std()
-        # gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
-        # selected_tokens.mul_(1 - gamma).add_(gamma * gaussian_map_exp_norm).clamp_(0.0, 1.0)
         # Compute optimized Gaussian blending for every 5th token
-        indices = torch.arange(sim_tokens_rest.shape[1]) % 5 == 0  # Select every 5th token
-        selected_tokens = sim_tokens_rest[:, indices, :, :]  # Filter out every 5th token
+        indices = torch.arange(sim_tokens_rest.shape[1]) % 2 == 0  # Select every nth token
+        selected_tokens = sim_tokens_rest[:, indices, :, :]  # Filter out every nth token
         selected_mean = selected_tokens.mean()
         selected_std = selected_tokens.std()
         gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean

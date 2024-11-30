@@ -34,6 +34,10 @@ class ControlNetDataset(Dataset):
         # get original source image size
         source_image = Image.open(os.path.join(self.source_images_path, self.source_image_files[0])).convert("RGB")
         self.source_image_size = source_image.size
+        
+        # get original target image size
+        target_image = Image.open(os.path.join(self.target_images_path, self.target_image_files[0])).convert("RGB")
+        self.target_image_size = target_image.size
     
     def balance_dataset_lengths(self):
         if len(self.source_image_files) < len(self.target_image_files):

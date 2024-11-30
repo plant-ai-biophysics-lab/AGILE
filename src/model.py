@@ -2475,7 +2475,8 @@ class AttentionGuidance:
                 generated = self.model.decode_first_stage(generated)
                 
                 # interpolate generated image to original size
-                generated = nn.functional.interpolate(generated, size=original_size, mode='bilinear', align_corners=False)
+                original_size_flipped = (original_size[1], original_size[0])  # Flip the dimensions
+                generated = nn.functional.interpolate(generated, size=original_size_flipped, mode='bilinear', align_corners=False)
                 generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
                 generated = (generated - generated.min()) / (generated.max() - generated.min())
                 generated = (generated * 255).astype(np.uint8)

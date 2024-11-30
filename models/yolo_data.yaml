@@ -1,0 +1,6 @@
+names:
+- '0'
+nc: 1
+path: /group/jmearlesgrp/intermediate_data/eranario/AGILE/apple_spain2usa/yolo/temp
+train: images/train
+val: images/test

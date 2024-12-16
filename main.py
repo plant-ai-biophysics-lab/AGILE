@@ -55,6 +55,11 @@ def main(args):
     # get optimized prompt embedding if exists
     if args.prompt_embedding is not None:
         prompt = torch.load(args.prompt_embedding)
+        # squeeze prompt if 3 dims
+        if prompt.dim() == 3:
+            prompt = prompt.squeeze(0)
+    elif args.prompt == "None":
+        prompt = torch.randn(77, 768)
     else:
         prompt = args.prompt
     
@@ -68,7 +73,8 @@ def main(args):
         target_images_path=args.target_images_path,
         prompt=prompt,
         transform=transform,
-        optimizing=args.optimize_embeddings
+        optimizing=args.optimize_embeddings,
+        spread_factor=args.spread_factor
     )
     dataloader = DataLoader(
         dataset,
@@ -77,30 +83,30 @@ def main(args):
         shuffle=True
     )
     
-    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
-    logger.train_dataloader = dataloader
+    # logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
+    # logger.train_dataloader = dataloader
     
-    # prepare wandb logger
-    wandb_logger = WandbLogger(
-        entity='paibl',
-        project='controlnet',
-        name=f"{args.logs_dir.name}_initial_training",
-        save_dir=args.logs_dir,
-    )
+    # # prepare wandb logger
+    # wandb_logger = WandbLogger(
+    #     entity='paibl',
+    #     project='controlnet',
+    #     name=f"{args.logs_dir.name}_initial_training",
+    #     save_dir=args.logs_dir,
+    # )
     
-    # start training
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        default_root_dir=args.logs_dir,
-        precision = 32,
-        callbacks = [logger],
-        logger=wandb_logger,
-        accumulate_grad_batches=args.batch_size*4,
-    )
-    trainer.fit(model, dataloader)
+    # # start training
+    # trainer = pl.Trainer(
+    #     max_epochs=args.epochs,
+    #     default_root_dir=args.logs_dir,
+    #     precision = 32,
+    #     callbacks = [logger],
+    #     logger=wandb_logger,
+    #     accumulate_grad_batches=args.batch_size*4,
+    # )
+    # trainer.fit(model, dataloader)
     
-    # end wandb
-    wandb.finish()
+    # # end wandb
+    # wandb.finish()
     
     #######################################################
     ############### EMBEDDING OPTIMIZATION ################
@@ -109,14 +115,14 @@ def main(args):
     # optimize embeddings
     if args.optimize_embeddings:
                 
-        # Set up the Wandb logger for embedding optimization
-        wandb.init(
-            entity='paibl',
-            project='controlnet',
-            name=f"{args.logs_dir.name}_embedding_optimization",
-            dir=args.logs_dir,
-            resume=False
-        )
+        # # Set up the Wandb logger for embedding optimization
+        # wandb.init(
+        #     entity='paibl',
+        #     project='controlnet',
+        #     name=f"{args.logs_dir.name}_embedding_optimization",
+        #     dir=args.logs_dir,
+        #     resume=False
+        # )
         
         # Initialize Text Embedding Optimizer
         text_optimizer = TextEmbeddingOptimizer(
@@ -132,7 +138,7 @@ def main(args):
         )
         
         # Use subset of dataloader
-        num_indices = min(3, len(dataset))
+        num_indices = min(5, len(dataset))
         subset_indices = random.sample(range(len(dataset)), num_indices)
         print(f"Optimizing embeddings images: {subset_indices}")
         subset_dataset = Subset(dataset, subset_indices)
@@ -145,7 +151,7 @@ def main(args):
         
         # Initialize Trainer for embedding optimization
         text_optimizer.train(optimize_dataloader, num_epochs=args.optimize_epochs)
-        wandb.finish()
+        # wandb.finish()
         
     #######################################################
     ################# ATTENTION GUIDANCE ##################
@@ -154,23 +160,22 @@ def main(args):
     if args.control_attentions:
         
         # TODO: REMOVE THIS DEBUG AFTER DRAFT RUNS
-        # reduce dataset size to 5 for debugging
-        # sub_dataset = Subset(dataset, random.sample(range(len(dataset)), 5))
-        # dataloader_debug = DataLoader(
-        #     sub_dataset,
-        #     num_workers=0,
-        #     batch_size=args.batch_size,
-        #     shuffle=True
-        # )
-        
-        # Set up the Wandb logger for embedding optimization
-        wandb.init(
-            entity='paibl',
-            project='controlnet',
-            name=f"{args.logs_dir.name}_attention_guidance",
-            dir=args.logs_dir,
-            resume=False
+        sub_dataset = Subset(dataset, random.sample(range(len(dataset)), 100))
+        dataloader_debug = DataLoader(
+            sub_dataset,
+            num_workers=0,
+            batch_size=args.batch_size,
+            shuffle=True
         )
+        
+        # # Set up the Wandb logger for embedding optimization
+        # wandb.init(
+        #     entity='paibl',
+        #     project='controlnet',
+        #     name=f"{args.logs_dir.name}_attention_guidance",
+        #     dir=args.logs_dir,
+        #     resume=False
+        # )
         
         # get beta pairs
         betas = ast.literal_eval(args.betas)
@@ -186,7 +191,7 @@ def main(args):
             betas=betas
         )
         
-        attention_guidance.train(dataloader, original_size=dataset.source_image_size)
+        attention_guidance.train(dataloader_debug, original_size=dataset.source_image_size)
 
 if __name__ == "__main__":
     
@@ -235,6 +240,8 @@ if __name__ == "__main__":
                     help="If set, final images will be generated at the end.")
     ap.add_argument('--betas', type=str, default='[[50, 40], [50, 25], [50, 20]]', 
                     help="List of beta pairs, e.g., '[[50, 40], [50, 25], [50, 20]]'")
+    ap.add_argument('--spread_factor', type=float, default=4.0,
+                    help="Spread factor for Gaussian map, for larger objects, recommend 2.")
     args = ap.parse_args()
     
     main(args)

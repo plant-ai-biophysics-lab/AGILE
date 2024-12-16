@@ -1127,7 +1127,7 @@ class CrossAttention(nn.Module):
         self._ATTN_PRECISION = "fp32"
         self.use_checkpoint = False  # Flag to enable/disable checkpointing
         
-    def apply_attention_edit(self, sim_target, gaussian_map, beta1=1.0, beta2=1.0, attn_weights=None, gamma=1.0):
+    def apply_attention_edit(self, sim_target, gaussian_map, background_map, beta1=1.0, beta2=1.0, attn_weights=None, gamma=1.0):
         # Extract sizes and precompute constants
         target_size = gaussian_map.shape[-1]
         map_size = int(math.sqrt(sim_target.shape[1]))
@@ -1140,35 +1140,28 @@ class CrossAttention(nn.Module):
         if map_size != target_size:
             sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
-        # Split token 1 and the rest
-        sim_token_1 = sim_target[:, 1:2, :, :]  # Keep as a single-channel tensor
-        sim_tokens_rest = sim_target[:, 2:, :, :]
-
-        # Compute statistics for token 1 in-place
-        sim_1_mean = sim_token_1.mean()
-        sim_1_std = sim_token_1.std()
-        gaussian_map_norm = gaussian_map * (sim_1_std * beta1) + sim_1_mean
-        sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
-
-        # Compute optimized Gaussian blending for every 5th token
-        indices = torch.arange(sim_tokens_rest.shape[1]) % 2 == 0  # Select every nth token
-        selected_tokens = sim_tokens_rest[:, indices, :, :]  # Filter out every nth token
-        selected_mean = selected_tokens.mean()
-        selected_std = selected_tokens.std()
-        gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
-        selected_tokens = selected_tokens * (1 - gamma) + gamma * gaussian_map_exp_norm
-        selected_tokens = selected_tokens.clamp(0.0, 1.0)
-
-        # Update only every 5th token in sim_tokens_rest
-        sim_tokens_rest[:, indices, :, :] = selected_tokens
+        sim_token_object = sim_target[:, 1, :, :]
+        sim_token_background = sim_target[:, 2::3, :, :]
+        
+        # compute statistics for object tokens
+        sim_object_mean = sim_token_object.mean()
+        sim_object_std = sim_token_object.std()
+        gaussian_map_norm_object = gaussian_map * (sim_object_std * beta1) + sim_object_mean
+        sim_token_object.mul_(1 - gamma).add_(gamma * gaussian_map_norm_object).clamp_(0.0, 1.0)
+        
+        # compute statistics for background tokens
+        sim_background_mean = sim_token_background.mean()
+        sim_background_std = sim_token_background.std()
+        gaussian_map_norm_background = gaussian_map * (sim_background_std * beta2) + sim_background_mean
+        sim_token_background.mul_(1 - gamma).add_(gamma * gaussian_map_norm_background).clamp_(0.0, 1.0)
 
         # Reapply attention weights if provided
         if attn_weights is not None:
-            sim_tokens_rest.mul_(attn_weights.view(1, -1, 1, 1))
+            print("Attention weights are not being used...")
 
         # Combine token 1 and the rest
-        sim_target[:, 1:2, :, :] = sim_token_1
-        sim_target[:, 2:, :, :] = sim_tokens_rest
+        sim_target[:, 1, :, :] = sim_token_object
+        sim_target[:, 2::3, :, :] = sim_token_background
 
         # Downsample to original size if needed
         if target_size != map_size:
@@ -1177,7 +1170,7 @@ class CrossAttention(nn.Module):
         # Reshape back to [num_heads, map_size * map_size, num_tokens]
         return sim_target.permute(0, 2, 3, 1).reshape(num_heads, -1, num_tokens)
 
-    def attention(self, q, k, v, control_attentions=False, gaussian_map=None, mask=None, attn_weights=None, beta1=1.0, beta2=0.1):
+    def attention(self, q, k, v, control_attentions=False, gaussian_map=None, background_map=None, mask=None, attn_weights=None, beta1=1.0, beta2=0.1):
         is_fp32 = self._ATTN_PRECISION == "fp32"
 
         with torch.autocast(enabled=not is_fp32, device_type='cuda'):
@@ -1190,7 +1183,7 @@ class CrossAttention(nn.Module):
 
             # Apply attention edits if necessary
             if control_attentions:
-                sim = self.apply_attention_edit(sim, gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                sim = self.apply_attention_edit(sim, gaussian_map, background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
 
         # Apply mask if provided
         if exists(mask):
@@ -1204,7 +1197,10 @@ class CrossAttention(nn.Module):
         
         return out, sim
 
-    def forward(self, x, context=None, mask=None, return_attn_weights=False, optimize=False, control_attentions=False, gaussian_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
+    def forward(
+        self, x, context=None, mask=None, return_attn_weights=False, optimize=False, control_attentions=False, 
+        gaussian_map=None, background_map=None, attn_weights=None, beta1=1.0, beta2=0.1
+    ):
         
         if optimize:
             with torch.enable_grad():
@@ -1215,13 +1211,13 @@ class CrossAttention(nn.Module):
                 v = self.to_v(context)
                 q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-                def checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights, beta1, beta2):
-                    return self.attention(q, k, v, control_attentions, gaussian_map, mask, attn_weights, beta1, beta2)
+                def checkpointed_attention(q, k, v, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2):
+                    return self.attention(q, k, v, control_attentions, gaussian_map, background_map, mask, attn_weights, beta1, beta2)
 
                 if self.use_checkpoint:
-                    out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map, attn_weights, beta1, beta2), (), self.use_checkpoint)
+                    out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2), (), self.use_checkpoint)
                 else:
-                    out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights, beta1, beta2)
+                    out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2)
                 
                 out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
                 
@@ -1235,13 +1231,13 @@ class CrossAttention(nn.Module):
             v = self.to_v(context)
             q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-            def checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights, beta1, beta2):
-                    return self.attention(q, k, v, control_attentions, gaussian_map, mask, attn_weights, beta1, beta2)
+            def checkpointed_attention(q, k, v, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2):
+                    return self.attention(q, k, v, control_attentions, gaussian_map, background_map, mask, attn_weights, beta1, beta2)
 
             if self.use_checkpoint:
-                out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map, attn_weights, beta1, beta2), (), self.use_checkpoint)
+                out, sim = checkpoint(checkpointed_attention, (q, k, v, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2), (), self.use_checkpoint)
             else:
-                out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map, attn_weights, beta1, beta2)
+                out, sim = checkpointed_attention(q, k, v, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2)
             
             out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
             
@@ -1302,21 +1298,20 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = False
 
-    def forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
+    def forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, background_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
         # return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
         # print('transformer input requires grad:', x.requires_grad, context.requires_grad)
-        return checkpoint(self._forward, x, context, optimize, layer, control_attentions, gaussian_map, attn_weights, beta1, beta2)
+        return checkpoint(self._forward, x, context, optimize, layer, control_attentions, gaussian_map, background_map, attn_weights, beta1, beta2)
 
-    def _forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
+    def _forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, background_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
         if optimize:
             with torch.enable_grad() and torch.autograd.graph.save_on_cpu():
                 attn1_output = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False, optimize=optimize)
-                # self.attn_maps['attn1'] = attn1_weights  # Store the attention weights
                 x = attn1_output + x  # Update x with the output of attn1
 
                 attn2_output, attn2_weights = self.attn2(
                     self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions, 
-                    gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                    gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
                 )
                 attn_maps = {'attn2': attn2_weights}
                 x = attn2_output + x  # Update x with the output of attn2
@@ -1330,7 +1325,7 @@ class BasicTransformerBlock(nn.Module):
 
             attn2_output, attn2_weights = self.attn2(
                 self.norm2(x), context=context, return_attn_weights=True, optimize=optimize, control_attentions=control_attentions,
-                gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
             )
             attn_maps = {'attn2': attn2_weights}
             x = attn2_output + x  # Update x with the output of attn2
@@ -1412,6 +1407,11 @@ class SpatialTransformer(nn.Module):
         else:
             gaussian_map = None
             
+        if 'background_map' in kwargs:
+            background_map = kwargs['background_map']
+        else:
+            background_map = None
+            
         # check if attn_weights
         if 'attn_weights' in kwargs:
             attn_weights = kwargs['attn_weights']
@@ -1451,8 +1451,10 @@ class SpatialTransformer(nn.Module):
                 context[i] = rearrange(context[i], 'b c h w -> b (h w) c').contiguous()
 
             if layer is not None:
-                x, attn_map = block(x, context=context[i], optimize=optimize, layer=layer, 
-                                    control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                x, attn_map = block(
+                    x, context=context[i], optimize=optimize, layer=layer, control_attentions=control_attentions, 
+                    gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                )
                 attn_maps.append(attn_map)
             else:
                 x = block(x, context=context[i], optimize=optimize, layer=layer)
@@ -1838,25 +1840,8 @@ class DDIMSamplerWithGrad(object):
         #### ATTENTION GUIDANCE ####
         control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
         if control_attentions:
-            
-            # Add a to kwargs
-            # target_map = kwargs['gaussian_map']  # Assume Gaussian map is [512, 512]
-            # batch_idx = kwargs['batch_idx']
-            # logs_dir = kwargs['logs_dir']
-            # source_img = kwargs['source_img']
+
             betas = kwargs['betas']
-            # opt_steps = 1
-            
-            # Prefill the grid for normal images and prompt maps
-            # num_timesteps_to_display = 6  # For Timestep 50, 40, 30, 20, 10, 0
-            # grid_images = [[None for _ in range(num_timesteps_to_display + 1)] for _ in range(opt_steps)]  # +1 for source_img
-            
-            # Prefill the grid for prompt maps with timesteps in columns and rows are tokens [1, 5, 10, 30, 50, 70]
-            # tokens_to_display = [1, 5, 10, 30, 50, 70]
-            # prompt_map_grid = [[None for _ in range(num_timesteps_to_display)] for _ in range(len(tokens_to_display))]  # +1 for target_map
-            
-            # Timesteps to display (every 10th step, starting from 50)
-            # timesteps_to_display = [49, 40, 30, 20, 10, 0]
             
             # for opt_step in range(opt_steps):
             for i, step in enumerate(iterator):
@@ -1870,14 +1855,19 @@ class DDIMSamplerWithGrad(object):
                         beta2 = betas[0][1]
                         kwargs['beta1'] = beta1
                         kwargs['beta2'] = beta2
-                    elif index >= 15:
+                    elif index > 25:
                         beta1 = betas[1][0]
                         beta2 = betas[1][1]
                         kwargs['beta1'] = beta1
                         kwargs['beta2'] = beta2
-                    else:
+                    elif index > 10:
                         beta1 = betas[2][0]
                         beta2 = betas[2][1]
+                        kwargs['beta1'] = beta1
+                        kwargs['beta2'] = beta2
+                    else:
+                        beta1 = betas[3][0]
+                        beta2 = betas[3][1]
                         kwargs['beta1'] = beta1
                         kwargs['beta2'] = beta2
 
@@ -2018,10 +2008,15 @@ class DDIMSamplerWithGrad(object):
         else:
             beta2 = 0.1
 
+        if 'background_map' in kwargs:
+            background_map = kwargs['background_map']
+        else:
+            background_map = None
+
         def forward_model(x_in, t_in, c_in):
             if control_attentions:
                 return self.model.apply_model(x_in, t_in, c_in, 
-                            save_attention=True, optimizing=False, control_attentions=True, gaussian_map=gaussian_map, attn_weights=a_vector, beta1=beta1, beta2=beta2
+                            save_attention=True, optimizing=False, control_attentions=True, gaussian_map=gaussian_map, background_map=background_map, attn_weights=a_vector, beta1=beta1, beta2=beta2
                         )
             return self.model.apply_model(x_in, t_in, c_in, save_attention=True, optimizing=optimizing)
 

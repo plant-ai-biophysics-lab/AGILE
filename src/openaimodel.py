@@ -72,6 +72,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
         optimizing = kwargs['optimizing'] if 'optimizing' in kwargs else False
         control_attentions = kwargs['control_attentions'] if 'control_attentions' in kwargs else False
         gaussian_map = kwargs['gaussian_map'] if 'gaussian_map' in kwargs else None
+        background_map = kwargs['background_map'] if 'background_map' in kwargs else None
         attn_weights = kwargs['attn_weights'] if 'attn_weights' in kwargs else None
         beta1 = kwargs['beta1'] if 'beta1' in kwargs else 1.0
         beta2 = kwargs['beta2'] if 'beta2' in kwargs else 0.1
@@ -81,9 +82,10 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             elif isinstance(layer, SpatialTransformer):
                 # check if 'layer' is in kwargs
                 if 'layer' in kwargs:
-                    x, attn_maps = layer(x, context, layer=kwargs['layer'], optimizing=optimizing, 
-                                         control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
-                                        )
+                    x, attn_maps = layer(
+                        x, context, layer=kwargs['layer'], optimizing=optimizing, control_attentions=control_attentions, 
+                        gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                    )
                 else:
                     x = layer(x, context, optimizing=optimizing)
             else:

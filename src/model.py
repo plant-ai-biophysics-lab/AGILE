@@ -1015,11 +1015,10 @@ class LatentDiffusion(DDPM):
             if not self.cond_stage_trainable or force_c_encode:
                 # check if xc is already a tensor
                 if torch.is_tensor(xc):
-                    c = xc.squeeze(0)
+                    c = xc.to(self.device)
                 elif isinstance(xc, dict) or isinstance(xc, list):
                     c = self.get_learned_conditioning(xc)
                 else:
-                    # c = self.get_learned_conditioning(xc.to(self.device))
                     c = self.get_learned_conditioning(xc).to(self.device)
             else:
                 c = xc
@@ -1040,7 +1039,7 @@ class LatentDiffusion(DDPM):
                 
         # get attention map
         if 'attn_map' in batch.keys():
-            attn_map = batch['attn_map']
+            attn_map = batch['attn_map']['object']
         else:
             attn_map = None
             
@@ -1147,7 +1146,7 @@ class LatentDiffusion(DDPM):
 
         if self.parameterization == "eps_attn":
             model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True, 
-                                                       control_attentions=True, gaussian_map=kwargs['attn_map'].squeeze(0),
+                                                       control_attentions=True, gaussian_map=kwargs['attn_map']['object'].squeeze(0),
                                                        attn_weights=self.model.a)
         else:
             model_output = self.apply_model(x_noisy, t, cond)
@@ -1185,7 +1184,7 @@ class LatentDiffusion(DDPM):
         # Get attention loss
         if self.parameterization == "eps_attn":
             avg_attn, all_token_attns = self.get_avg_attn(attn_maps)
-            target_attn = kwargs['attn_map'].squeeze(0)
+            target_attn = kwargs['attn_map']['object'].squeeze(0)
 
             # Visualize source and target attn at every 250 steps
             if self.save_attn_counter % 250 == 0:
@@ -1740,6 +1739,9 @@ class ControlLDM(LatentDiffusion):
         beta1 = kwargs.get('beta1', 1.0)
         beta2 = kwargs.get('beta2', 0.1)
         
+        # get background map
+        background_map = kwargs.get('background_map', None)
+        
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
@@ -1750,6 +1752,10 @@ class ControlLDM(LatentDiffusion):
         else:
             cond_txt = torch.cat(cond['c_crossattn'], 1)
         # require grad if cond['c_crossattn'] required grad
+        
+        # # if cond_txt.shape is [1, 1, 77, 768], squeeze
+        # if cond_txt.shape[0] == 1 and cond_txt.shape[1] == 1:
+        #     cond_txt = cond_txt.squeeze(0)
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
@@ -1761,7 +1767,8 @@ class ControlLDM(LatentDiffusion):
                     if save_attention:
                         eps, attn_maps_layer = diffusion_model(
                             x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention, 
-                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                            optimizing=optimizing, control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2,
+                            background_map=background_map
                         )
                         return eps, attn_maps_layer
                     else:
@@ -1772,11 +1779,11 @@ class ControlLDM(LatentDiffusion):
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if save_attention:
                     eps, attn_maps_layer = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
-                                                           control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                                                           control_attentions=control_attentions, gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
                     return eps, attn_maps_layer
                 else:
                     eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, save_attention=save_attention,
-                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                                          control_attentions=control_attentions, gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
                     return eps
 
     @torch.no_grad()
@@ -1800,40 +1807,7 @@ class ControlLDM(LatentDiffusion):
             log["control"] = c_cat
         else:
             c_cat, c = None, c["c_crossattn"][0][:N]
-        # N = min(z.shape[0], N)
-        # n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
-        # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
-        # log["conditioning"] = self.decode_cond_stage(c)
-
-        # if plot_diffusion_rows:
-        #     # get diffusion row
-        #     diffusion_row = list()
-        #     z_start = z[:n_row]
-        #     for t in range(self.num_timesteps):
-        #         if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
-        #             t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
-        #             t = t.to(self.device).long()
-        #             noise = torch.randn_like(z_start)
-        #             z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
-        #             diffusion_row.append(self.decode_first_stage(z_noisy))
-
-        #     diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
-        #     diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
-        #     diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
-        #     diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
-        #     log["diffusion_row"] = diffusion_grid
-
-        # if sample:
-        #     # get denoise row
-        #     samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-        #                                              batch_size=N, ddim=use_ddim,
-        #                                              ddim_steps=ddim_steps, eta=ddim_eta)
-        #     x_samples = self.decode_first_stage(samples)
-        #     log["samples"] = x_samples
-        #     if plot_denoise_rows:
-        #         denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
-        #         log["denoise_row"] = denoise_grid
 
         if unconditional_guidance_scale > 0.0:
             uc_cross = self.get_unconditional_conditioning(N)
@@ -1910,14 +1884,17 @@ class ControlledUnetModel(UNetModel):
         # check if attn_weights is in kwargs else None
         attn_weights = kwargs.get('attn_weights', None)
         
+        background_map = kwargs.get('background_map', None)
+        
         # get betas
         beta1 = kwargs.get('beta1', 1.0)
-        beta2 = kwargs.get('beta2', 0.1)
+        beta2 = kwargs.get('beta2', 1.0)
         
         # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
-        layers_to_control = [3, 4, 5, 6, 7, 8]
+        layers_to_control = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+        # layers_to_control = [3, 4, 5, 6]
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -1944,8 +1921,10 @@ class ControlledUnetModel(UNetModel):
             if i in layers_to_save and 'save_attention' in kwargs and kwargs['save_attention']:
                 layer = i
                 if i in layers_to_control:
-                    h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing, 
-                                          control_attentions=control_attentions, gaussian_map=gaussian_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2)
+                    h, attn_maps = module(
+                        h, emb, context, layer=layer, optimizing=optimizing, control_attentions=control_attentions, 
+                        gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
+                    )
                 else:
                     h, attn_maps = module(h, emb, context, layer=layer, optimizing=optimizing)
                 attn_maps_layer[layer] = attn_maps
@@ -2268,7 +2247,7 @@ class TextEmbeddingOptimizer:
         # clear torch cache
         torch.cuda.empty_cache()
 
-    def parse_attn_maps(self, attn_maps, timestep_to_optimize):
+    def parse_attn_maps(self, attn_maps, timestep_to_optimize, token_start=1, token_end=2):
         
         for _, attn_map_step in enumerate(attn_maps):
             (timestep, attn_map_layers), = attn_map_step.items()
@@ -2277,8 +2256,9 @@ class TextEmbeddingOptimizer:
                 for _, (_, attn_map) in enumerate(attn_map_layers.items()):
                     for attn_type, values in attn_map[0].items():
                         if attn_type == self.att_type:
-                            # keep only class token
-                            values = values[:, :, 1] # TODO: Try averaging across all the tokens
+
+                            values = values[:, :, token_start:token_end]
+                            values = values.mean(dim=2)
                             a_map = values.mean(dim=0)
                             map_size = int(math.sqrt(a_map.shape[-1]))
                             a_map = a_map.view(map_size, map_size)
@@ -2302,8 +2282,13 @@ class TextEmbeddingOptimizer:
     def train(self, dataloader, num_epochs=1):
         # if prompt is tensor, skip encoding
         if isinstance(self.prompt, torch.Tensor):
-            print("Using optimized embedding!")
-            text_embedding = self.prompt.clone().detach().to(self.device)
+            # check if self.prompt is shape [77, 768]
+            if self.prompt.shape == (77, 768):
+                print("Using randomized embedding!")
+                text_embedding = self.prompt.unsqueeze(0).clone().detach().to(self.device)  # Add batch dimension
+            else:
+                print("Using optimized embedding!")
+                text_embedding = self.prompt.clone().detach().to(self.device)
         else:
             latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
             text_embedding = latent_from_prompt.clone().detach().to(self.device)
@@ -2348,12 +2333,37 @@ class TextEmbeddingOptimizer:
                     # Post-process the generated result
                     generated = self.model.decode_first_stage(generated)
                     source_attn_map = intermediates['attn_maps']
-                    source_attn_map = self.parse_attn_maps(source_attn_map, self.timestep_to_optimize).to(self.device)
-                    target_attn_map = batch['attn_map'].squeeze(0).to(self.device)
+                    
+                    # object attention maps
+                    object_source_attn_map = self.parse_attn_maps(
+                        source_attn_map, self.timestep_to_optimize, token_start=1, token_end=2).to(self.device)
+                    object_target_attn_map = batch['attn_map']['object'].squeeze(0).to(self.device)
+                    
+                    # # background attention maps
+                    # background_source_attn_map = self.parse_attn_maps(
+                    #     source_attn_map, self.timestep_to_optimize, token_start=2, token_end=78).to(self.device)
+                    # background_target_attn_map = batch['attn_map']['background'].squeeze(0).to(self.device)
 
-                    # Compute loss and backward pass
-                    loss = self.mse_loss(source_attn_map, target_attn_map)
-                    loss.backward()
+                    # Compute loss for object and background
+                    object_loss = self.mse_loss(object_source_attn_map, object_target_attn_map)
+                    # background_loss = self.mse_loss(background_source_attn_map, background_target_attn_map)
+                    
+                    # compute gradients for first half
+                    object_loss.backward(retain_graph=True)
+                    object_grad = text_embedding.grad.clone()
+                    optimizer.zero_grad()
+                    
+                    # compute gradients for second half
+                    # background_loss.backward()
+                    # background_grad = text_embedding.grad.clone()
+                    
+                    # combine gradients
+                    object_mask = torch.zeros_like(text_embedding)
+                    object_mask[:, 1, :] = 1 # TODO: check if its actually token 0?
+                    # background_mask = torch.zeros_like(text_embedding)
+                    # background_mask[:, 2:, :] = 1
+                    # text_embedding.grad = object_grad * object_mask + background_grad * background_mask
+                    text_embedding.grad = object_grad * object_mask
                     optimizer.step()
                     scheduler.step()
                     
@@ -2367,20 +2377,28 @@ class TextEmbeddingOptimizer:
                 
                     # Log images every 10 optimization steps
                     if _ % 10 == 0:
-                        self.log_images(generated, target_attn_map, source_attn_map, batch_idx, _)
+                        # self.log_images(
+                        #     generated, object_target_attn_map, object_source_attn_map,
+                        #     background_target_attn_map, background_source_attn_map,
+                        #     batch_idx, _
+                        # )
+                        self.log_images(
+                            generated, object_target_attn_map, object_source_attn_map,
+                            batch_idx, _
+                        )
 
-                    print(f"Epoch: {epoch}, Batch: {batch_idx}, Opt_step: {_}, Loss: {loss.item()}")
+
+                    print(f"Epoch: {epoch}, Batch: {batch_idx}, Opt_step: {_}")
+                    # print(f"Object Loss First: {object_loss.item()}, Background Loss Second: {background_loss.item()}")
+                    print(f"Object Loss First: {object_loss.item()}")
                     print(f"Learing Rate: {scheduler.get_last_lr()}")
-
-                    # Log optimization loss with wandb
-                    wandb.log({'optimization/loss': loss.item()}, step=current_step)
                     current_step += 1
         
         # Retrieve and save the optimized embeddings
         optimized_embeddings = text_embedding.detach().cpu()
         torch.save(optimized_embeddings, os.path.join(self.logs_dir, "optimized_embeddings.pt"))
-
-    def log_images(self, generated, target_attn_map, source_attn_map, idx, opt_steps):
+        
+    def log_images(self, generated, object_target, object_source, idx, opt_steps):
         generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
         generated = (generated - generated.min()) / (generated.max() - generated.min())
         generated = (generated * 255).astype(np.uint8)
@@ -2391,15 +2409,48 @@ class TextEmbeddingOptimizer:
         ax[0].axis('off')
         ax[0].set_title('Generated Image')
 
-        ax[1].imshow(target_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[1].imshow(object_target.cpu().detach().numpy(), cmap='viridis')
         ax[1].axis('off')
-        ax[1].set_title('Target Attention Map')
+        ax[1].set_title('Object Target Attention Map')
 
-        ax[2].imshow(source_attn_map.cpu().detach().numpy(), cmap='viridis')
+        ax[2].imshow(object_source.cpu().detach().numpy(), cmap='viridis')
         ax[2].axis('off')
-        ax[2].set_title('Source Attention Map')
+        ax[2].set_title('Object Source Attention Map')
+
+        # Background-related plots removed or set to None
 
         plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+        plt.close()
+
+    # def log_images(self, generated, object_target, object_source, background_target, background_source, idx, opt_steps):
+    #     generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+    #     generated = (generated - generated.min()) / (generated.max() - generated.min())
+    #     generated = (generated * 255).astype(np.uint8)
+
+    #     fig, ax = plt.subplots(1, 5, figsize=(25, 5))
+
+    #     ax[0].imshow(generated)
+    #     ax[0].axis('off')
+    #     ax[0].set_title('Generated Image')
+
+    #     ax[1].imshow(object_target.cpu().detach().numpy(), cmap='viridis')
+    #     ax[1].axis('off')
+    #     ax[1].set_title('Object Target Attention Map')
+
+    #     ax[2].imshow(object_source.cpu().detach().numpy(), cmap='viridis')
+    #     ax[2].axis('off')
+    #     ax[2].set_title('Object Source Attention Map')
+
+    #     ax[3].imshow(background_target.cpu().detach().numpy(), cmap='viridis')
+    #     ax[3].axis('off')
+    #     ax[3].set_title('Background Target Attention Map')
+
+    #     ax[4].imshow(background_source.cpu().detach().numpy(), cmap='viridis')
+    #     ax[4].axis('off')
+    #     ax[4].set_title('Background Source Attention Map')
+
+    #     plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+    #     plt.close()
         
 class AttentionGuidance:
     
@@ -2436,8 +2487,13 @@ class AttentionGuidance:
         
         # get prompt embedding
         if isinstance(self.prompt, torch.Tensor):
-            print("Using optimized embedding!")
-            text_embedding = self.prompt.clone().detach().to(self.device)
+            # check if self.prompt is shape [77, 768]
+            if self.prompt.shape == (77, 768):
+                print("Using randomized embedding!")
+                text_embedding = self.prompt.unsqueeze(0).clone().detach().to(self.device)  # Add batch dimension
+            else:
+                print("Using optimized embedding!")
+                text_embedding = self.prompt.clone().detach().to(self.device)
         else:
             latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
             text_embedding = latent_from_prompt.clone().detach().to(self.device)
@@ -2455,7 +2511,8 @@ class AttentionGuidance:
                 uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
                 
                 # get target attention map from batch
-                gaussian_map = batch['attn_map'].squeeze(0).to(self.device)
+                gaussian_map = batch['attn_map']['object'].squeeze(0).to(self.device)
+                background_map = batch['attn_map']['background'].squeeze(0).to(self.device)
                 
                 # Sample generation and attention maps
                 generated, _ = self.model.sample_log_with_grad(
@@ -2469,7 +2526,8 @@ class AttentionGuidance:
                     batch_idx=batch_idx,
                     logs_dir=self.logs_dir,
                     source_img=batch['hint'],
-                    betas=self.betas
+                    betas=self.betas,
+                    background_map=background_map
                 )
                 
                 generated = self.model.decode_first_stage(generated)

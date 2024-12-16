@@ -1,7 +1,5 @@
 import torch
 import einops
-import copy
-import cv2
 import torch.nn as nn
 import numpy as np
 import tqdm
@@ -21,9 +19,6 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from omegaconf import ListConfig
-from transformers import pipeline
-from PIL import Image
-from torchviz import make_dot
 from torch.optim.lr_scheduler import StepLR
 
 from src.modules import LitEma, make_beta_schedule, Encoder, Decoder, DiagonalGaussianDistribution, normal_kl, \
@@ -645,8 +640,8 @@ class DDPM(pl.LightningModule):
                  prog_bar=True, logger=True, on_step=True, on_epoch=False)
         
         # Log each item in the loss_dict on step
-        wandb.log({f"{k}": v for k, v in loss_dict.items()}, step=self.global_step)
-        wandb.log({"global_step": self.global_step}, step=self.global_step)
+        # wandb.log({f"{k}": v for k, v in loss_dict.items()}, step=self.global_step)
+        # wandb.log({"global_step": self.global_step}, step=self.global_step)
         
         # if batch_idx == 0:  # Visualize the graph for the first batch only to avoid clutter
         #     make_dot(loss, params={"a": self.model.a}).render("attn_graph", format="png")
@@ -1016,8 +1011,9 @@ class LatentDiffusion(DDPM):
                 # check if xc is already a tensor
                 if torch.is_tensor(xc):
                     c = xc.to(self.device)
-                elif isinstance(xc, dict) or isinstance(xc, list):
-                    c = self.get_learned_conditioning(xc)
+                elif isinstance(xc, list):
+                    # go through list (not dict) and apply to device
+                    c = self.get_learned_conditioning(xc).to(self.device)
                 else:
                     c = self.get_learned_conditioning(xc).to(self.device)
             else:

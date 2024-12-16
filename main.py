@@ -24,9 +24,9 @@ def main(args):
     #######################################################
     mismatch_count = 0
     total_count = 0
-    model = create_model(args.model_config).cpu()
+    model = create_model(args.model_config)
     if args.checkpoint:
-        state_dict = load_state_dict(args.checkpoint, location='cpu')
+        state_dict = load_state_dict(args.checkpoint, location='cuda')
         for name, param in model.named_parameters():
             total_count += 1
             if name in state_dict:
@@ -47,6 +47,9 @@ def main(args):
     model.control_scales = ([strength] * 13)
     
     print(f"Using parameterization: {model.parameterization}")
+    
+    # move model back to GPU
+    model = model.to('cuda')
     
     #######################################################
     ################## TRAINING SETUP #####################
@@ -83,8 +86,8 @@ def main(args):
         shuffle=True
     )
     
-    # logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
-    # logger.train_dataloader = dataloader
+    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
+    logger.train_dataloader = dataloader
     
     # # prepare wandb logger
     # wandb_logger = WandbLogger(
@@ -94,16 +97,15 @@ def main(args):
     #     save_dir=args.logs_dir,
     # )
     
-    # # start training
-    # trainer = pl.Trainer(
-    #     max_epochs=args.epochs,
-    #     default_root_dir=args.logs_dir,
-    #     precision = 32,
-    #     callbacks = [logger],
-    #     logger=wandb_logger,
-    #     accumulate_grad_batches=args.batch_size*4,
-    # )
-    # trainer.fit(model, dataloader)
+    # start training
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        default_root_dir=args.logs_dir,
+        precision = 32,
+        callbacks = [logger],
+        accumulate_grad_batches=args.batch_size*4
+    )
+    trainer.fit(model, dataloader)
     
     # # end wandb
     # wandb.finish()

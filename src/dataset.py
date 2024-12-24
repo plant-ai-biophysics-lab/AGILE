@@ -7,13 +7,14 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 class ControlNetDataset(Dataset):
-    def __init__(self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, spread_factor=4.0):
+    def __init__(self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, spread_factor=4.0, betas=None):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
         self.prompt = prompt
         self.transform = transform
         self.optimizing = optimizing
         self.spread_factor = spread_factor
+        self.betas=betas
         
         # Load image file paths
         self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
@@ -29,7 +30,8 @@ class ControlNetDataset(Dataset):
                 'source': source_file,
                 'target': target_file,
                 'prompt': self.prompt,
-                'control': None # placeholder for control
+                'control': None, # placeholder for control
+                'betas': self.betas
             })
             
         # get original source image size
@@ -133,6 +135,7 @@ class ControlNetDataset(Dataset):
         source_image_file = item['source']
         target_image_file = item['target']
         prompt = item['prompt']
+        betas = item['betas']
 
         source_image_path = os.path.join(self.source_images_path, source_image_file)
         target_image_path = os.path.join(self.target_images_path, target_image_file)
@@ -170,4 +173,5 @@ class ControlNetDataset(Dataset):
             source_path=source_image_path,
             target_path=target_image_path,
             attn_map=attn_map,
+            betas=betas
         )

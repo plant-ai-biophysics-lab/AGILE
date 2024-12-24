@@ -1039,7 +1039,10 @@ class LatentDiffusion(DDPM):
         else:
             attn_map = None
             
-        out = [z, c, y, attn_map]
+        # get betas
+        betas = batch['betas']
+            
+        out = [z, c, y, attn_map, betas]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -1086,8 +1089,8 @@ class LatentDiffusion(DDPM):
         return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, y, c, attn_map = self.get_input(batch, self.first_stage_key)
-        loss = self(x, y, c, attn_map=attn_map)
+        x, y, c, attn_map, betas = self.get_input(batch, self.first_stage_key)
+        loss = self(x, y, c, attn_map=attn_map, betas=betas)
         return loss
 
     def forward(self, x, y, c, *args, **kwargs):
@@ -1141,9 +1144,14 @@ class LatentDiffusion(DDPM):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         if self.parameterization == "eps_attn":
-            model_output, attn_maps = self.apply_model(x_noisy, t, cond, save_attention=True, optimizing=True, 
-                                                       control_attentions=True, gaussian_map=kwargs['attn_map']['object'].squeeze(0),
-                                                       attn_weights=self.model.a)
+            betas = kwargs['betas']
+            betas = np.array([[item.cpu().detach().item() for item in row] for row in betas])
+            model_output = self.apply_model(x_noisy, t, cond, save_attention=False, optimizing=False,
+                                                       control_attentions=True, gaussian_map=kwargs['attn_map'],
+                                                       beta1=betas[3][0], beta2=betas[3][1])
+            # return self.model.apply_model(x_in, t_in, c_in, 
+            #                 save_attention=True, optimizing=False, control_attentions=True, gaussian_map=gaussian_map, background_map=background_map, attn_weights=a_vector, beta1=beta1, beta2=beta2
+            #             )
         else:
             model_output = self.apply_model(x_noisy, t, cond)
 
@@ -1177,22 +1185,6 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
         
-        # Get attention loss
-        if self.parameterization == "eps_attn":
-            avg_attn, all_token_attns = self.get_avg_attn(attn_maps)
-            target_attn = kwargs['attn_map']['object'].squeeze(0)
-
-            # Visualize source and target attn at every 250 steps
-            if self.save_attn_counter % 250 == 0:
-                self.save_attn(avg_attn, target_attn, all_token_attns, self.save_attn_counter, timestep=int(t), save_dir=self.logger.save_dir)
-            
-            attn_loss = torch.nn.functional.mse_loss(avg_attn, target_attn)
-            # loss = loss + self.attn_loss_weight * attn_loss
-            loss = self.attn_loss_weight * attn_loss
-
-            loss_dict.update({f'{prefix}/attn_loss': attn_loss})
-            loss_dict.update({f'{prefix}/loss_with_attn': loss})
-            self.save_attn_counter += 1
         return loss, loss_dict
     
     @staticmethod
@@ -1704,7 +1696,7 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c, y, attn_map = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: synthetic c: prompt y: real
+        x, c, y, attn_map, betas = super().get_input(batch, self.first_stage_key, *args, **kwargs) # x: synthetic c: prompt y: real
         control = batch[self.control_key]
         if bs is not None:
             control = control[:bs]
@@ -1712,7 +1704,7 @@ class ControlLDM(LatentDiffusion):
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
         # return x, dict(c_crossattn=[c], c_concat=None)
-        return x, y, dict(c_crossattn=[c], c_concat=[control]), attn_map # c_crossattn: condition / c_concat: hint (synthetic)
+        return x, y, dict(c_crossattn=[c], c_concat=[control]), attn_map, betas # c_crossattn: condition / c_concat: hint (synthetic)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         
@@ -1796,7 +1788,7 @@ class ControlLDM(LatentDiffusion):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, _, c, _ = self.get_input(batch, self.first_stage_key, bs=N)
+        z, _, c, _, _ = self.get_input(batch, self.first_stage_key, bs=N)
         if c["c_concat"] is not None:
             c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
             # log["control"] = c_cat * 2.0 - 1.0
@@ -1806,16 +1798,31 @@ class ControlLDM(LatentDiffusion):
         log["reconstruction"] = self.decode_first_stage(z)
 
         if unconditional_guidance_scale > 0.0:
+            gaussian_map = batch['attn_map']['object'].squeeze(0).to(self.device)
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, intermediates = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                             batch_size=N, ddim=use_ddim,
-                                             ddim_steps=ddim_steps, eta=ddim_eta,
-                                             unconditional_guidance_scale=unconditional_guidance_scale,
-                                             unconditional_conditioning=uc_full,
-                                             **kwargs
-                                             )
+            if self.parameterization == "eps_attn":
+                betas = batch['betas']
+                betas = np.array([[item.cpu().detach().item() for item in row] for row in betas])
+                samples_cfg, intermediates = self.sample_log_with_grad(
+                    cond={"c_concat": [c_cat], "c_crossattn": [c]},
+                    batch_size=N, ddim=use_ddim,
+                    ddim_steps=ddim_steps, eta=ddim_eta,
+                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    unconditional_conditioning=uc_full,
+                    control_attentions=True,
+                    gaussian_map=gaussian_map,
+                    betas=betas
+                    )
+            else:
+                samples_cfg, intermediates = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+                batch_size=N, ddim=use_ddim,
+                ddim_steps=ddim_steps, eta=ddim_eta,
+                unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_conditioning=uc_full,
+                **kwargs
+                )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             x_samples_attn_maps = get_attn_maps(intermediates['attn_maps'])
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
@@ -2209,7 +2216,7 @@ class TextEmbeddingOptimizer:
         ddim_steps,
         image_size,
         unconditional_guidance_scale,
-        timestep_to_optimize='timestep_30', # TODO: Try optimizing at an earlier timestep
+        timestep_to_optimize='timestep_45', # TODO: Try optimizing at an earlier timestep
         logs_dir='optimize_logs',
         optimization_steps=100,
         *args, **kwargs
@@ -2307,7 +2314,7 @@ class TextEmbeddingOptimizer:
                 use_ddim = self.ddim_steps is not None
 
                 # Get input data
-                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                _, _, c, _, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
                 c_cat = c["c_concat"][0][:N]
 
                 uc_cross = self.model.get_unconditional_conditioning(N)
@@ -2345,8 +2352,9 @@ class TextEmbeddingOptimizer:
                     # background_loss = self.mse_loss(background_source_attn_map, background_target_attn_map)
                     
                     # compute gradients for first half
-                    object_loss.backward(retain_graph=True)
-                    object_grad = text_embedding.grad.clone()
+                    # object_loss.backward(retain_graph=True)
+                    object_loss.backward()
+                    # object_grad = text_embedding.grad.clone()
                     optimizer.zero_grad()
                     
                     # compute gradients for second half
@@ -2354,12 +2362,12 @@ class TextEmbeddingOptimizer:
                     # background_grad = text_embedding.grad.clone()
                     
                     # combine gradients
-                    object_mask = torch.zeros_like(text_embedding)
-                    object_mask[:, 1, :] = 1 # TODO: check if its actually token 0?
+                    # object_mask = torch.zeros_like(text_embedding)
+                    # object_mask[:, 1, :] = 1 # TODO: check if its actually token 0?
                     # background_mask = torch.zeros_like(text_embedding)
                     # background_mask[:, 2:, :] = 1
                     # text_embedding.grad = object_grad * object_mask + background_grad * background_mask
-                    text_embedding.grad = object_grad * object_mask
+                    # text_embedding.grad = object_grad * object_mask
                     optimizer.step()
                     scheduler.step()
                     
@@ -2394,36 +2402,12 @@ class TextEmbeddingOptimizer:
         optimized_embeddings = text_embedding.detach().cpu()
         torch.save(optimized_embeddings, os.path.join(self.logs_dir, "optimized_embeddings.pt"))
         
-    def log_images(self, generated, object_target, object_source, idx, opt_steps):
-        generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
-        generated = (generated - generated.min()) / (generated.max() - generated.min())
-        generated = (generated * 255).astype(np.uint8)
-
-        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-
-        ax[0].imshow(generated)
-        ax[0].axis('off')
-        ax[0].set_title('Generated Image')
-
-        ax[1].imshow(object_target.cpu().detach().numpy(), cmap='viridis')
-        ax[1].axis('off')
-        ax[1].set_title('Object Target Attention Map')
-
-        ax[2].imshow(object_source.cpu().detach().numpy(), cmap='viridis')
-        ax[2].axis('off')
-        ax[2].set_title('Object Source Attention Map')
-
-        # Background-related plots removed or set to None
-
-        plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
-        plt.close()
-
-    # def log_images(self, generated, object_target, object_source, background_target, background_source, idx, opt_steps):
+    # def log_images(self, generated, object_target, object_source, idx, opt_steps):
     #     generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
     #     generated = (generated - generated.min()) / (generated.max() - generated.min())
     #     generated = (generated * 255).astype(np.uint8)
 
-    #     fig, ax = plt.subplots(1, 5, figsize=(25, 5))
+    #     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
 
     #     ax[0].imshow(generated)
     #     ax[0].axis('off')
@@ -2437,16 +2421,40 @@ class TextEmbeddingOptimizer:
     #     ax[2].axis('off')
     #     ax[2].set_title('Object Source Attention Map')
 
-    #     ax[3].imshow(background_target.cpu().detach().numpy(), cmap='viridis')
-    #     ax[3].axis('off')
-    #     ax[3].set_title('Background Target Attention Map')
-
-    #     ax[4].imshow(background_source.cpu().detach().numpy(), cmap='viridis')
-    #     ax[4].axis('off')
-    #     ax[4].set_title('Background Source Attention Map')
+    #     # Background-related plots removed or set to None
 
     #     plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
     #     plt.close()
+
+    def log_images(self, generated, object_target, object_source, background_target, background_source, idx, opt_steps):
+        generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+        generated = (generated - generated.min()) / (generated.max() - generated.min())
+        generated = (generated * 255).astype(np.uint8)
+
+        fig, ax = plt.subplots(1, 5, figsize=(25, 5))
+
+        ax[0].imshow(generated)
+        ax[0].axis('off')
+        ax[0].set_title('Generated Image')
+
+        ax[1].imshow(object_target.cpu().detach().numpy(), cmap='viridis')
+        ax[1].axis('off')
+        ax[1].set_title('Object Target Attention Map')
+
+        ax[2].imshow(object_source.cpu().detach().numpy(), cmap='viridis')
+        ax[2].axis('off')
+        ax[2].set_title('Object Source Attention Map')
+
+        ax[3].imshow(background_target.cpu().detach().numpy(), cmap='viridis')
+        ax[3].axis('off')
+        ax[3].set_title('Background Target Attention Map')
+
+        ax[4].imshow(background_source.cpu().detach().numpy(), cmap='viridis')
+        ax[4].axis('off')
+        ax[4].set_title('Background Source Attention Map')
+
+        plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+        plt.close()
         
 class AttentionGuidance:
     
@@ -2500,7 +2508,7 @@ class AttentionGuidance:
                 use_ddim = self.ddim_steps is not None
                 
                 # Get input data
-                _, _, c, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
+                _, _, c, _, _ = self.model.get_input(batch, self.model.first_stage_key, bs=N)
                 c_cat = c["c_concat"][0][:N]
                 uc_cross = self.model.get_unconditional_conditioning(N)
                 uc_cat = c_cat

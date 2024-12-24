@@ -24,9 +24,9 @@ def main(args):
     #######################################################
     mismatch_count = 0
     total_count = 0
-    model = create_model(args.model_config)
+    model = create_model(args.model_config).cpu()
     if args.checkpoint:
-        state_dict = load_state_dict(args.checkpoint, location='cuda')
+        state_dict = load_state_dict(args.checkpoint, location='cpu')
         for name, param in model.named_parameters():
             total_count += 1
             if name in state_dict:
@@ -38,8 +38,11 @@ def main(args):
         print(f"Mismatches: {mismatch_count} out of {total_count}")
     
     # edit model parameters
+    print(f"Using learning rate: {args.learning_rate}")
     model.learning_rate = args.learning_rate
+    print(f"Using sd_locked: {args.sd_locked}")
     model.sd_locked = args.sd_locked
+    print(f"Using only_mid_control: {args.only_mid_control}")
     model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
     
@@ -48,15 +51,13 @@ def main(args):
     
     print(f"Using parameterization: {model.parameterization}")
     
-    # move model back to GPU
-    model = model.to('cuda')
-    
     #######################################################
     ################## TRAINING SETUP #####################
     #######################################################
     
     # get optimized prompt embedding if exists
     if args.prompt_embedding is not None:
+        print("Using optimized embeddings!")
         prompt = torch.load(args.prompt_embedding)
         # squeeze prompt if 3 dims
         if prompt.dim() == 3:
@@ -67,6 +68,7 @@ def main(args):
         prompt = args.prompt
     
     # prepare dataset and dataloader
+    betas = ast.literal_eval(args.betas)
     transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
         PermuteTransform()
@@ -77,7 +79,8 @@ def main(args):
         prompt=prompt,
         transform=transform,
         optimizing=args.optimize_embeddings,
-        spread_factor=args.spread_factor
+        spread_factor=args.spread_factor,
+        betas=betas
     )
     dataloader = DataLoader(
         dataset,
@@ -236,12 +239,12 @@ if __name__ == "__main__":
                     help="Path to optimized prompt embedding.")
     ap.add_argument("--control_attentions", action="store_true",
                     help="If set, control attentions will be used.")
-    ap.add_argument("--control_strength", type=float, default=1.0,
+    ap.add_argument("--control_strength", type=float, default=5.0,
                     help="Strength of control.")
     ap.add_argument("--generate_images", action="store_true",
                     help="If set, final images will be generated at the end.")
-    ap.add_argument('--betas', type=str, default='[[50, 40], [50, 25], [50, 20]]', 
-                    help="List of beta pairs, e.g., '[[50, 40], [50, 25], [50, 20]]'")
+    ap.add_argument('--betas', type=str, default='[[50, 40], [50, 30], [50, 25], [50, 20]]', 
+                    help="List of beta pairs, e.g., '[[50, 40], [50, 30], [50, 25], [50, 20]]'")
     ap.add_argument('--spread_factor', type=float, default=4.0,
                     help="Spread factor for Gaussian map, for larger objects, recommend 2.")
     args = ap.parse_args()

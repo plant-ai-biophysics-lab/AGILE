@@ -11,18 +11,18 @@ SOURCE_IMAGES_PATH="/data2/eranario/data/AGILE-Datasets/Grape-Detection/Syntheti
 TARGET_IMAGES_PATH="/data2/eranario/data/AGILE-Datasets/Grape-Detection/BordenDayRow/train/images"  # Path to target images
 BATCH_SIZE=1  # Batch size for training
 IMAGE_SIZE=512  # Input image size
-EPOCHS=10  # Number of epochs for training
-PARAM="eps"  # Parameterization for loss
-OPTIMIZE_EMBEDDINGS=true  # Optimize embeddings
-PROMPT="grape"  # Prompt for text embeddings
+EPOCHS=50  # Number of epochs for training
+PARAM="eps_attn"  # Parameterization for loss
 OPTIMIZE_EPOCHS=1  # Number of epochs for optimizing embeddings
 OPTIMIZE_STEPS=50  # Number of optimization steps
 SPREAD_FACTOR=4.0  # Spread factor for Gaussian map
 CONTROL_STRENGTH=5.0  # Control strength for ControlNet
-LR=0.0001  # Learning rate
+LR=0.00001  # Learning rate
+PROMPT_EMBEDDING="/data2/eranario/intermediate_data/AGILE/borden_syn2day/1216_OPTIMIZE_SF-3_EPOCHS-20_PART-3/text_optimizer/optimized_embeddings.pt" # Path to optimized embeddings
+BETAS="[[35, 20], [35, 10], [35, 5], [35, 1]]"  # Betas for ControlNet
 
 # Make logs directory
-RUN_NAME="1221_OPTIMIZE_TS-49"
+RUN_NAME="1220_CONTROL_GUIDE-TRAIN_LAST-BETA"
 LOGS_DIR="/data2/eranario/intermediate_data/AGILE/borden_syn2day/$RUN_NAME"  # Directory to save logs
 mkdir -p $LOGS_DIR
 
@@ -39,10 +39,9 @@ python3 $CURRENT_PATH/main.py \
   --epochs "$EPOCHS" \
   --logs_dir "$LOGS_DIR" \
   --param "$PARAM" \
-  $( [ "$OPTIMIZE_EMBEDDINGS" = true ] && echo "--optimize_embeddings" ) \
-  --prompt "$PROMPT" \
   --lr "$LR" \
   --control_strength "$CONTROL_STRENGTH" \
-  --optimize_epochs "$OPTIMIZE_EPOCHS" \
-  --optimize_steps "$OPTIMIZE_STEPS" \
-  --spread_factor "$SPREAD_FACTOR"
+  --spread_factor "$SPREAD_FACTOR" \
+  --prompt_embedding "$PROMPT_EMBEDDING" \
+  --control_attentions \
+  --betas "$BETAS"

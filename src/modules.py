@@ -70,11 +70,6 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
                                         return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
         tokens = batch_encoding["input_ids"].to(self.device)
-        
-        # check if transformer is in correct device
-        if self.transformer.device != self.device:
-            self.transformer = self.transformer.to(self.device)
-            
         outputs = self.transformer(input_ids=tokens, output_hidden_states=self.layer=="hidden")
         if self.layer == "last":
             z = outputs.last_hidden_state
@@ -1146,7 +1141,7 @@ class CrossAttention(nn.Module):
             sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
         sim_token_object = sim_target[:, 1, :, :]
-        sim_token_background = sim_target[:, 2::3, :, :]
+        sim_token_background = sim_target[:, 2::5, :, :]
         
         # compute statistics for object tokens
         sim_object_mean = sim_token_object.mean()
@@ -1166,7 +1161,7 @@ class CrossAttention(nn.Module):
 
         # Combine token 1 and the rest
         sim_target[:, 1, :, :] = sim_token_object
-        sim_target[:, 2::3, :, :] = sim_token_background
+        sim_target[:, 2::5, :, :] = sim_token_background
 
         # Downsample to original size if needed
         if target_size != map_size:
@@ -1895,6 +1890,11 @@ class DDIMSamplerWithGrad(object):
                                         unconditional_conditioning=unconditional_conditioning,
                                         dynamic_threshold=dynamic_threshold, **kwargs)
                 img, pred_x0, attn_maps = outs
+                
+                if index % log_every_t == 0 or index == total_steps - 1:
+                        intermediates['x_inter'].append(img)
+                        intermediates['pred_x0'].append(pred_x0)
+                        intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
                     
                 # ### NOTE FOR DEBUGGING NOTE ###
                 #     # Check if `index` is in `timesteps_to_display`

@@ -38,7 +38,7 @@ def get_obj_from_str(string, reload=False):
 
 def create_model(config_path):
     config = OmegaConf.load(config_path)
-    model = instantiate_from_config(config.model)
+    model = instantiate_from_config(config.model).cpu()
     print(f'Loaded model config from [{config_path}]')
     return model
 

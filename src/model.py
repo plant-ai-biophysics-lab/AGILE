@@ -2216,7 +2216,7 @@ class TextEmbeddingOptimizer:
         ddim_steps,
         image_size,
         unconditional_guidance_scale,
-        timestep_to_optimize='timestep_45', # TODO: Try optimizing at an earlier timestep
+        timestep_to_optimize='timestep_30', # TODO: Try optimizing at an earlier timestep
         logs_dir='optimize_logs',
         optimization_steps=100,
         *args, **kwargs
@@ -2261,8 +2261,8 @@ class TextEmbeddingOptimizer:
                         if attn_type == self.att_type:
 
                             values = values[:, :, token_start:token_end]
-                            values = values.mean(dim=2)
-                            a_map = values.mean(dim=0)
+                            values_mean = values.mean(dim=2)
+                            a_map = values_mean.mean(dim=0)
                             map_size = int(math.sqrt(a_map.shape[-1]))
                             a_map = a_map.view(map_size, map_size)
                             a_map = a_map.unsqueeze(0).unsqueeze(0)
@@ -2342,20 +2342,25 @@ class TextEmbeddingOptimizer:
                         source_attn_map, self.timestep_to_optimize, token_start=1, token_end=2).to(self.device)
                     object_target_attn_map = batch['attn_map']['object'].squeeze(0).to(self.device)
                     
+                    loss = self.mse_loss(object_source_attn_map, object_target_attn_map)
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    
                     # # background attention maps
                     # background_source_attn_map = self.parse_attn_maps(
                     #     source_attn_map, self.timestep_to_optimize, token_start=2, token_end=78).to(self.device)
                     # background_target_attn_map = batch['attn_map']['background'].squeeze(0).to(self.device)
 
                     # Compute loss for object and background
-                    object_loss = self.mse_loss(object_source_attn_map, object_target_attn_map)
+                    # object_loss = self.mse_loss(object_source_attn_map, object_target_attn_map)
                     # background_loss = self.mse_loss(background_source_attn_map, background_target_attn_map)
                     
                     # compute gradients for first half
                     # object_loss.backward(retain_graph=True)
-                    object_loss.backward()
+                    # object_loss.backward()
                     # object_grad = text_embedding.grad.clone()
-                    optimizer.zero_grad()
+                    # optimizer.zero_grad()
                     
                     # compute gradients for second half
                     # background_loss.backward()
@@ -2368,8 +2373,8 @@ class TextEmbeddingOptimizer:
                     # background_mask[:, 2:, :] = 1
                     # text_embedding.grad = object_grad * object_mask + background_grad * background_mask
                     # text_embedding.grad = object_grad * object_mask
-                    optimizer.step()
-                    scheduler.step()
+                    # optimizer.step()
+                    # scheduler.step()
                     
                     for name, param in self.model.named_parameters():
                         if not torch.equal(param, initial_params[name]):
@@ -2394,7 +2399,7 @@ class TextEmbeddingOptimizer:
 
                     print(f"Epoch: {epoch}, Batch: {batch_idx}, Opt_step: {_}")
                     # print(f"Object Loss First: {object_loss.item()}, Background Loss Second: {background_loss.item()}")
-                    print(f"Object Loss First: {object_loss.item()}")
+                    print(f"Loss: {loss.item()}")
                     print(f"Learing Rate: {scheduler.get_last_lr()}")
                     current_step += 1
         
@@ -2402,36 +2407,12 @@ class TextEmbeddingOptimizer:
         optimized_embeddings = text_embedding.detach().cpu()
         torch.save(optimized_embeddings, os.path.join(self.logs_dir, "optimized_embeddings.pt"))
         
-    # def log_images(self, generated, object_target, object_source, idx, opt_steps):
-    #     generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
-    #     generated = (generated - generated.min()) / (generated.max() - generated.min())
-    #     generated = (generated * 255).astype(np.uint8)
-
-    #     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-
-    #     ax[0].imshow(generated)
-    #     ax[0].axis('off')
-    #     ax[0].set_title('Generated Image')
-
-    #     ax[1].imshow(object_target.cpu().detach().numpy(), cmap='viridis')
-    #     ax[1].axis('off')
-    #     ax[1].set_title('Object Target Attention Map')
-
-    #     ax[2].imshow(object_source.cpu().detach().numpy(), cmap='viridis')
-    #     ax[2].axis('off')
-    #     ax[2].set_title('Object Source Attention Map')
-
-    #     # Background-related plots removed or set to None
-
-    #     plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
-    #     plt.close()
-
-    def log_images(self, generated, object_target, object_source, background_target, background_source, idx, opt_steps):
+    def log_images(self, generated, object_target, object_source, idx, opt_steps):
         generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
         generated = (generated - generated.min()) / (generated.max() - generated.min())
         generated = (generated * 255).astype(np.uint8)
 
-        fig, ax = plt.subplots(1, 5, figsize=(25, 5))
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
 
         ax[0].imshow(generated)
         ax[0].axis('off')
@@ -2445,16 +2426,40 @@ class TextEmbeddingOptimizer:
         ax[2].axis('off')
         ax[2].set_title('Object Source Attention Map')
 
-        ax[3].imshow(background_target.cpu().detach().numpy(), cmap='viridis')
-        ax[3].axis('off')
-        ax[3].set_title('Background Target Attention Map')
-
-        ax[4].imshow(background_source.cpu().detach().numpy(), cmap='viridis')
-        ax[4].axis('off')
-        ax[4].set_title('Background Source Attention Map')
+        # Background-related plots removed or set to None
 
         plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
         plt.close()
+
+    # def log_images(self, generated, object_target, object_source, background_target, background_source, idx, opt_steps):
+    #     generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+    #     generated = (generated - generated.min()) / (generated.max() - generated.min())
+    #     generated = (generated * 255).astype(np.uint8)
+
+    #     fig, ax = plt.subplots(1, 5, figsize=(25, 5))
+
+    #     ax[0].imshow(generated)
+    #     ax[0].axis('off')
+    #     ax[0].set_title('Generated Image')
+
+    #     ax[1].imshow(object_target.cpu().detach().numpy(), cmap='viridis')
+    #     ax[1].axis('off')
+    #     ax[1].set_title('Object Target Attention Map')
+
+    #     ax[2].imshow(object_source.cpu().detach().numpy(), cmap='viridis')
+    #     ax[2].axis('off')
+    #     ax[2].set_title('Object Source Attention Map')
+
+    #     ax[3].imshow(background_target.cpu().detach().numpy(), cmap='viridis')
+    #     ax[3].axis('off')
+    #     ax[3].set_title('Background Target Attention Map')
+
+    #     ax[4].imshow(background_source.cpu().detach().numpy(), cmap='viridis')
+    #     ax[4].axis('off')
+    #     ax[4].set_title('Background Source Attention Map')
+
+    #     plt.savefig(f"{self.logs_dir}/optimization_batch-{idx}_opt-{opt_steps}.png")
+    #     plt.close()
         
 class AttentionGuidance:
     

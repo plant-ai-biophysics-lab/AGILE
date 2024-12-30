@@ -145,7 +145,7 @@ class DDIMSampler(object):
                corrector_kwargs=None,
                verbose=True,
                x_T=None,
-               log_every_t=10,
+               log_every_t=5,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
@@ -1757,7 +1757,7 @@ class DDIMSamplerWithGrad(object):
                corrector_kwargs=None,
                verbose=True,
                x_T=None,
-               log_every_t=10,
+               log_every_t=5,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
@@ -1812,7 +1812,7 @@ class DDIMSamplerWithGrad(object):
     def ddim_sampling(self, cond, shape,
                       x_T=None, ddim_use_original_steps=False,
                       callback=None, timesteps=None, quantize_denoised=False,
-                      mask=None, x0=None, img_callback=None, log_every_t=10,
+                      mask=None, x0=None, img_callback=None, log_every_t=5,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
                       ucg_schedule=None, **kwargs):

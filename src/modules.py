@@ -146,7 +146,7 @@ class DDIMSampler(object):
                verbose=True,
                x_T=None,
                log_every_t=5,
-               unconditional_guidance_scale=1.,
+               unconditional_guidance_scale=20.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
@@ -206,7 +206,7 @@ class DDIMSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=10,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
+                      unconditional_guidance_scale=20., unconditional_conditioning=None, dynamic_threshold=None,
                       ucg_schedule=None, **kwargs):
         device = self.model.betas.device
         b = shape[0]
@@ -262,7 +262,7 @@ class DDIMSampler(object):
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      unconditional_guidance_scale=20., unconditional_conditioning=None,
                       dynamic_threshold=None, **kwargs):
         b, *_, device = *x.shape, x.device
         
@@ -366,7 +366,7 @@ class DDIMSampler(object):
 
     @torch.no_grad()
     def encode(self, x0, c, t_enc, use_original_steps=False, return_intermediates=None,
-               unconditional_guidance_scale=1.0, unconditional_conditioning=None, callback=None):
+               unconditional_guidance_scale=20.0, unconditional_conditioning=None, callback=None):
         num_reference_steps = self.ddpm_num_timesteps if use_original_steps else self.ddim_timesteps.shape[0]
 
         assert t_enc <= num_reference_steps
@@ -428,7 +428,7 @@ class DDIMSampler(object):
                 extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise)
 
     @torch.no_grad()
-    def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=1.0, unconditional_conditioning=None,
+    def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=20.0, unconditional_conditioning=None,
                use_original_steps=False, callback=None):
 
         timesteps = np.arange(self.ddpm_num_timesteps) if use_original_steps else self.ddim_timesteps
@@ -907,7 +907,7 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         # Split token 1 and the rest
         sim_token_1 = sim_target[:, 1:2, :, :]  # Keep as a single-channel tensor
-        sim_tokens_rest = sim_target[:, 2:, :, :]
+        sim_tokens_rest = sim_target[:, 2::2, :, :]
 
         # Compute statistics for token 1 in-place
         sim_1_mean = sim_token_1.mean()
@@ -1141,19 +1141,22 @@ class CrossAttention(nn.Module):
             sim_target = F.interpolate(sim_target, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
         sim_token_object = sim_target[:, 1, :, :]
-        sim_token_background = sim_target[:, 2::5, :, :]
+        sim_token_background = sim_target[:, 2:, :, :]
         
         # compute statistics for object tokens
         sim_object_mean = sim_token_object.mean()
         sim_object_std = sim_token_object.std()
         gaussian_map_norm_object = gaussian_map * (sim_object_std * beta1) + sim_object_mean
         sim_token_object.mul_(1 - gamma).add_(gamma * gaussian_map_norm_object).clamp_(0.0, 1.0)
+        # sim_token_object.mul_(1 - gamma).mul_(gamma * gaussian_map).clamp_(0.0, 1.0)
+        # sim_token_object.mul_(gamma * gaussian_map)
         
         # compute statistics for background tokens
         sim_background_mean = sim_token_background.mean()
         sim_background_std = sim_token_background.std()
         gaussian_map_norm_background = gaussian_map * (sim_background_std * beta2) + sim_background_mean
         sim_token_background.mul_(1 - gamma).add_(gamma * gaussian_map_norm_background).clamp_(0.0, 1.0)
+        # sim_token_background.mul_(gamma * gaussian_map)
 
         # Reapply attention weights if provided
         if attn_weights is not None:
@@ -1161,7 +1164,7 @@ class CrossAttention(nn.Module):
 
         # Combine token 1 and the rest
         sim_target[:, 1, :, :] = sim_token_object
-        sim_target[:, 2::5, :, :] = sim_token_background
+        sim_target[:, 2:, :, :] = sim_token_background
 
         # Downsample to original size if needed
         if target_size != map_size:
@@ -1306,7 +1309,9 @@ class BasicTransformerBlock(nn.Module):
     def _forward(self, x, context=None, optimize=False, layer=None, control_attentions=False, gaussian_map=None, background_map=None, attn_weights=None, beta1=1.0, beta2=0.1):
         if optimize:
             with torch.enable_grad() and torch.autograd.graph.save_on_cpu():
-                attn1_output = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False, optimize=optimize)
+                attn1_output = self.attn1(
+                    self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False, optimize=optimize,
+                )
                 x = attn1_output + x  # Update x with the output of attn1
 
                 attn2_output, attn2_weights = self.attn2(
@@ -1314,13 +1319,15 @@ class BasicTransformerBlock(nn.Module):
                     gaussian_map=gaussian_map, background_map=background_map, attn_weights=attn_weights, beta1=beta1, beta2=beta2
                 )
                 attn_maps = {'attn2': attn2_weights}
-                x = attn2_output + x  # Update x with the output of attn2
+                x = attn2_output + x  # Update x with the output of attn2 
+                # x = attn2_output # TODO: TESTING
 
                 x = self.ff(self.norm3(x)) + x
             
         else:
-            attn1_output = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False, optimize=optimize)
-            # self.attn_maps['attn1'] = attn1_weights  # Store the attention weights
+            attn1_output = self.attn1(
+                self.norm1(x), context=context if self.disable_self_attn else None, return_attn_weights=False, optimize=optimize,
+            )
             x = attn1_output + x  # Update x with the output of attn1
 
             attn2_output, attn2_weights = self.attn2(
@@ -1329,6 +1336,7 @@ class BasicTransformerBlock(nn.Module):
             )
             attn_maps = {'attn2': attn2_weights}
             x = attn2_output + x  # Update x with the output of attn2
+            # x = attn2_output # TODO: TESTING
 
             x = self.ff(self.norm3(x)) + x
         
@@ -1758,7 +1766,7 @@ class DDIMSamplerWithGrad(object):
                verbose=True,
                x_T=None,
                log_every_t=5,
-               unconditional_guidance_scale=1.,
+               unconditional_guidance_scale=20.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
@@ -1814,7 +1822,7 @@ class DDIMSamplerWithGrad(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=5,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
+                      unconditional_guidance_scale=20., unconditional_conditioning=None, dynamic_threshold=None,
                       ucg_schedule=None, **kwargs):
         device = self.model.betas.device
         b = shape[0]
@@ -1866,10 +1874,11 @@ class DDIMSamplerWithGrad(object):
                         kwargs['beta1'] = beta1
                         kwargs['beta2'] = beta2
                     else:
-                        beta1 = betas[3][0]
-                        beta2 = betas[3][1]
-                        kwargs['beta1'] = beta1
-                        kwargs['beta2'] = beta2
+                        # beta1 = betas[3][0]
+                        # beta2 = betas[3][1]
+                        # kwargs['beta1'] = beta1
+                        # kwargs['beta2'] = beta2
+                        kwargs['control_attentions'] = False
 
                 ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -1896,37 +1905,37 @@ class DDIMSamplerWithGrad(object):
                         intermediates['pred_x0'].append(pred_x0)
                         intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
                     
-                # ### NOTE FOR DEBUGGING NOTE ###
-                #     # Check if `index` is in `timesteps_to_display`
-                #     if index in timesteps_to_display:
-                #         timestep_index = timesteps_to_display.index(index)
-                #         img_decoded = self.model.decode_first_stage(img)
-                #         grid_images[opt_step][timestep_index] = img_decoded  # Store in prefilled grid for selected timesteps
+            #     ### NOTE FOR DEBUGGING NOTE ###
+            #         # Check if `index` is in `timesteps_to_display`
+            #         if index in timesteps_to_display:
+            #             timestep_index = timesteps_to_display.index(index)
+            #             img_decoded = self.model.decode_first_stage(img)
+            #             grid_images[opt_step][timestep_index] = img_decoded  # Store in prefilled grid for selected timesteps
                         
-                #         # Save the corresponding `prompt_map` in the prompt_map_grid if in last opt_step
-                #         if opt_step == opt_steps - 1:
+            #             # Save the corresponding `prompt_map` in the prompt_map_grid if in last opt_step
+            #             if opt_step == opt_steps - 1:
                             
-                #             # get tokens to display from avg_attn_maps
-                #             display_avg_attn_maps = self.parse_attn_maps(attn_maps)
-                #             tokens_to_display_avg = display_avg_attn_maps[:, :, tokens_to_display]
-                #             for i, _ in enumerate(tokens_to_display):
-                #                 token_colored = self.apply_viridis_colormap(tokens_to_display_avg[:, :, i])
-                #                 prompt_map_grid[i][timestep_index] = token_colored
+            #                 # get tokens to display from avg_attn_maps
+            #                 display_avg_attn_maps = self.parse_attn_maps(attn_maps)
+            #                 tokens_to_display_avg = display_avg_attn_maps[:, :, tokens_to_display]
+            #                 for i, _ in enumerate(tokens_to_display):
+            #                     token_colored = self.apply_viridis_colormap(tokens_to_display_avg[:, :, i])
+            #                     prompt_map_grid[i][timestep_index] = token_colored
                     
-                # # Add source_img and target_map at the end of each row
-                # grid_images[opt_step][-1] = source_img.squeeze(0).permute(2, 0, 1)  # Add source image at the end of the row in the normal grid
-                # ### NOTE FOR DEBUGGING NOTE ###
+            #     # Add source_img and target_map at the end of each row
+            #     grid_images[opt_step][-1] = source_img.squeeze(0).permute(2, 0, 1)  # Add source image at the end of the row in the normal grid
+            #     ### NOTE FOR DEBUGGING NOTE ###
                 
-                # ### NOTE FOR DEBUGGING NOTE ###
-                # # Reset img
-                # if x_T is None:
-                #     img = torch.randn(shape, device=device)
-                # else:
-                #     img = x_T
-                # kwargs['control_attentions'] = True
-                # print('Setting control attentions back to True')
-                # iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
-                # ### NOTE FOR DEBUGGING NOTE ###
+            #     ### NOTE FOR DEBUGGING NOTE ###
+            #     # Reset img
+            #     if x_T is None:
+            #         img = torch.randn(shape, device=device)
+            #     else:
+            #         img = x_T
+            #     kwargs['control_attentions'] = True
+            #     print('Setting control attentions back to True')
+            #     iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+            #     ### NOTE FOR DEBUGGING NOTE ###
 
             #  ### NOTE FOR DEBUGGING NOTE ###
             # # Generate the image grid from the prefilled array for both normal images and prompt maps
@@ -2030,7 +2039,7 @@ class DDIMSamplerWithGrad(object):
             if use_checkpoint:
                 # check if inputs need grads
                 # print('input gradients:', x.requires_grad, t.requires_grad, c.requires_grad)
-                model_output, attn_maps = checkpoint(forward_model, x, t, c, control_attentions)
+                model_output, attn_maps = checkpoint(forward_model, x, t, c)
             else:
                 model_output, attn_maps = forward_model(x, t, c, control_attentions)
         else:

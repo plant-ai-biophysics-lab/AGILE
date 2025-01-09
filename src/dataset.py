@@ -7,7 +7,9 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 class ControlNetDataset(Dataset):
-    def __init__(self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, spread_factor=4.0, betas=None):
+    def __init__(
+        self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, spread_factor=4.0, betas=None, generated=None
+    ):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
         self.prompt = prompt
@@ -15,10 +17,15 @@ class ControlNetDataset(Dataset):
         self.optimizing = optimizing
         self.spread_factor = spread_factor
         self.betas=betas
+        self.generated = generated
         
         # Load image file paths
-        self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
-        self.target_image_files = [f for f in os.listdir(target_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
+        if self.generated is not None:
+            self.source_image_files = [f for f in os.listdir(self.generated) if f.endswith(('jpg', 'jpeg', 'png'))]
+            self.target_image_files = [f for f in os.listdir(self.generated) if f.endswith(('jpg', 'jpeg', 'png'))]
+        else:
+            self.source_image_files = [f for f in os.listdir(source_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
+            self.target_image_files = [f for f in os.listdir(target_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
         
         # Balance the dataset lengths
         self.balance_dataset_lengths()
@@ -37,10 +44,6 @@ class ControlNetDataset(Dataset):
         # get original source image size
         source_image = Image.open(os.path.join(self.source_images_path, self.source_image_files[0])).convert("RGB")
         self.source_image_size = source_image.size
-        
-        # get original target image size
-        target_image = Image.open(os.path.join(self.target_images_path, self.target_image_files[0])).convert("RGB")
-        self.target_image_size = target_image.size
     
     def balance_dataset_lengths(self):
         if len(self.source_image_files) < len(self.target_image_files):
@@ -137,15 +140,21 @@ class ControlNetDataset(Dataset):
         prompt = item['prompt']
         betas = item['betas']
 
-        source_image_path = os.path.join(self.source_images_path, source_image_file)
-        target_image_path = os.path.join(self.target_images_path, target_image_file)
+        if self.generated is not None:
+            source_image_path = os.path.join(self.generated, source_image_file)
+            target_image_path = os.path.join(self.generated, target_image_file)
+            original_source_path = os.path.join(self.source_images_path, source_image_file)
+            yolo_file = original_source_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
+        else:
+            source_image_path = os.path.join(self.source_images_path, source_image_file)
+            target_image_path = os.path.join(self.target_images_path, target_image_file)
+            yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
         
         # Load images
         source_image = Image.open(source_image_path).convert("RGB")
         target_image = Image.open(target_image_path).convert("RGB")
             
         # Get attention map
-        yolo_file = source_image_path.replace('images', 'labels').replace('.jpg', '.txt').replace('.jpeg', '.txt').replace('.png', '.txt')
         attn_map = self.gaussian_map(np.array(source_image), yolo_file)
         
         # Apply transformations if any
@@ -165,6 +174,8 @@ class ControlNetDataset(Dataset):
         
         if self.optimizing:
             target_image = source_image
+        else:
+            source_image = target_image
 
         return dict(
             jpg=target_image,

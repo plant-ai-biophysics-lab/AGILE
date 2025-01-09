@@ -17,6 +17,10 @@ from src.logger import ImageLogger
 from src.model import TextEmbeddingOptimizer, AttentionGuidance
 from lightning.pytorch.loggers import WandbLogger
 
+# hide warnings
+import warnings
+warnings.filterwarnings("ignore")
+
 def main(args):
     
     #######################################################
@@ -43,10 +47,10 @@ def main(args):
     print(f"Using sd_locked: {args.sd_locked}")
     model.sd_locked = args.sd_locked
     print(f"Using only_mid_control: {args.only_mid_control}")
-    model.only_mid_control = args.only_mid_control
+    model.only_mid_control = True
     model.parameterization = args.param
     
-    strength = args.control_strength
+    strength = 5
     model.control_scales = ([strength] * 13)
     
     print(f"Using parameterization: {model.parameterization}")
@@ -110,7 +114,7 @@ def main(args):
     )
     trainer.fit(model, dataloader)
     
-    # # end wandb
+    # end wandb
     # wandb.finish()
     
     #######################################################
@@ -137,9 +141,10 @@ def main(args):
             lr=0.01,
             ddim_steps=50,
             image_size=args.image_size,
-            unconditional_guidance_scale=20.0,
+            unconditional_guidance_scale=15.0,
+            timestep_to_optimize=f"timestep_{args.timestep}",
             logs_dir=os.path.join(args.logs_dir, "text_optimizer"),
-            optimization_steps=args.optimize_steps
+            optimization_steps=args.optimize_steps,
         )
         
         # Use subset of dataloader
@@ -164,39 +169,67 @@ def main(args):
     
     if args.control_attentions:
         
-        # TODO: REMOVE THIS DEBUG AFTER DRAFT RUNS
-        sub_dataset = Subset(dataset, random.sample(range(len(dataset)), 100))
-        dataloader_debug = DataLoader(
-            sub_dataset,
-            num_workers=0,
-            batch_size=args.batch_size,
-            shuffle=True
-        )
+        finetune_steps = 1
+        generated = None
         
-        # # Set up the Wandb logger for embedding optimization
-        # wandb.init(
-        #     entity='paibl',
-        #     project='controlnet',
-        #     name=f"{args.logs_dir.name}_attention_guidance",
-        #     dir=args.logs_dir,
-        #     resume=False
-        # )
+        model.only_mid_control = args.only_mid_control
+        strength = args.control_strength
+        model.control_scales = ([strength] * 13)
         
-        # get beta pairs
-        betas = ast.literal_eval(args.betas)
+        for step in range(finetune_steps):
+            
+            print(f"Finetuning step: {step}")
+            dataset_step = ControlNetDataset(
+                source_images_path=args.source_images_path,
+                target_images_path=args.source_images_path,
+                prompt=prompt,
+                transform=transform,
+                optimizing=args.optimize_embeddings,
+                spread_factor=args.spread_factor,
+                betas=betas,
+                generated=generated
+            )
+            dataloader_step = DataLoader(
+                dataset_step,
+                num_workers=0,
+                batch_size=args.batch_size,
+                shuffle=True
+            )
         
-        # Initialize Attention Guidance
-        attention_guidance = AttentionGuidance(
-            prompt=prompt,
-            model=model,
-            batch_size=args.batch_size,
-            ddim_steps=50,
-            unconditional_guidance_scale=20.0,
-            logs_dir=os.path.join(args.logs_dir, "attention_guidance"),
-            betas=betas
-        )
-        
-        attention_guidance.train(dataloader_debug, original_size=dataset.source_image_size)
+            # # TODO: REMOVE THIS DEBUG AFTER DRAFT RUNS
+            # sub_dataset = Subset(dataset, random.sample(range(len(dataset)), 100))
+            # dataloader_debug = DataLoader(
+            #     sub_dataset,
+            #     num_workers=0,
+            #     batch_size=args.batch_size,
+            #     shuffle=True
+            # )
+            
+            # # Set up the Wandb logger for embedding optimization
+            # wandb.init(
+            #     entity='paibl',
+            #     project='controlnet',
+            #     name=f"{args.logs_dir.name}_attention_guidance",
+            #     dir=args.logs_dir,
+            #     resume=False
+            # )
+            
+            # get beta pairs
+            betas = ast.literal_eval(args.betas)
+            
+            # Initialize Attention Guidance
+            generated = os.path.join(args.logs_dir, f"attention_guidance_{step}")
+            attention_guidance = AttentionGuidance(
+                prompt=prompt,
+                model=model,
+                batch_size=args.batch_size,
+                ddim_steps=50,
+                unconditional_guidance_scale=args.unconditional_guidance_scale,
+                logs_dir=generated,
+                betas=betas
+            )
+            
+            attention_guidance.train(dataloader_step, original_size=dataset.source_image_size)
 
 if __name__ == "__main__":
     
@@ -247,6 +280,10 @@ if __name__ == "__main__":
                     help="List of beta pairs, e.g., '[[50, 40], [50, 30], [50, 25], [50, 20]]'")
     ap.add_argument('--spread_factor', type=float, default=4.0,
                     help="Spread factor for Gaussian map, for larger objects, recommend 2.")
+    ap.add_argument('--timestep', type=int, default=30,
+                    help="Timestep in backward process to optimize text embedding.")
+    ap.add_argument('--unconditional_guidance_scale', type=float, default=15.0,
+                    help="Scale for unconditional guidance.")
     args = ap.parse_args()
     
     main(args)

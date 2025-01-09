@@ -1896,7 +1896,7 @@ class ControlledUnetModel(UNetModel):
         # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
-        layers_to_control = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+        layers_to_control = [3, 4, 5]
         # layers_to_control = [3, 4, 5, 6]
         attn_maps_layer = {}
         with torch.no_grad():
@@ -1909,7 +1909,7 @@ class ControlledUnetModel(UNetModel):
             h = self.middle_block(h, emb, context)
 
         if control is not None:
-            h += control.pop()
+            h += control.pop() 
         
         for i, module in enumerate(self.output_blocks):
             if only_mid_control or control is None:
@@ -2287,10 +2287,8 @@ class TextEmbeddingOptimizer:
         if isinstance(self.prompt, torch.Tensor):
             # check if self.prompt is shape [77, 768]
             if self.prompt.shape == (77, 768):
-                print("Using randomized embedding!")
                 text_embedding = self.prompt.unsqueeze(0).clone().detach().to(self.device)  # Add batch dimension
             else:
-                print("Using optimized embedding!")
                 text_embedding = self.prompt.clone().detach().to(self.device)
         else:
             latent_from_prompt = self.model.get_learned_conditioning(self.prompt)
@@ -2498,10 +2496,8 @@ class AttentionGuidance:
         if isinstance(self.prompt, torch.Tensor):
             # check if self.prompt is shape [77, 768]
             if self.prompt.shape == (77, 768):
-                print("Using randomized embedding!")
                 text_embedding = self.prompt.unsqueeze(0).clone().detach().to(self.device)  # Add batch dimension
             else:
-                print("Using optimized embedding!")
                 text_embedding = self.prompt.clone().detach().to(self.device)
         else:
             latent_from_prompt = self.model.get_learned_conditioning(self.prompt)

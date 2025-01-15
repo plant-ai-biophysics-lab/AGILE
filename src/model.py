@@ -1525,7 +1525,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=50, ddim_eta=0., return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
-                   plot_diffusion_rows=True, unconditional_guidance_scale=1., unconditional_guidance_label=None,
+                   plot_diffusion_rows=True, unconditional_guidance_scale=20., unconditional_guidance_label=None,
                    use_ema_scope=True,
                    **kwargs):
         ema_scope = self.ema_scope if use_ema_scope else nullcontext
@@ -1809,7 +1809,7 @@ class ControlLDM(LatentDiffusion):
                     cond={"c_concat": [c_cat], "c_crossattn": [c]},
                     batch_size=N, ddim=use_ddim,
                     ddim_steps=ddim_steps, eta=ddim_eta,
-                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    unconditional_guidance_scale=20.0,  
                     unconditional_conditioning=uc_full,
                     control_attentions=True,
                     gaussian_map=gaussian_map,
@@ -1819,7 +1819,7 @@ class ControlLDM(LatentDiffusion):
                 samples_cfg, intermediates = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
                 batch_size=N, ddim=use_ddim,
                 ddim_steps=ddim_steps, eta=ddim_eta,
-                unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_guidance_scale=15.0, # # TODO: EDIT THIS WITH GUIDANCE SCALE FOR TEXT OPTIMIZER
                 unconditional_conditioning=uc_full,
                 **kwargs
                 )

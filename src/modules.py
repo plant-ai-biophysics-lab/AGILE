@@ -146,7 +146,7 @@ class DDIMSampler(object):
                verbose=True,
                x_T=None,
                log_every_t=5,
-               unconditional_guidance_scale=20.,
+               unconditional_guidance_scale=15.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
@@ -206,7 +206,7 @@ class DDIMSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=10,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=20., unconditional_conditioning=None, dynamic_threshold=None,
+                      unconditional_guidance_scale=15., unconditional_conditioning=None, dynamic_threshold=None,
                       ucg_schedule=None, **kwargs):
         device = self.model.betas.device
         b = shape[0]
@@ -262,7 +262,7 @@ class DDIMSampler(object):
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=20., unconditional_conditioning=None,
+                      unconditional_guidance_scale=15., unconditional_conditioning=None,
                       dynamic_threshold=None, **kwargs):
         b, *_, device = *x.shape, x.device
         
@@ -366,7 +366,7 @@ class DDIMSampler(object):
 
     @torch.no_grad()
     def encode(self, x0, c, t_enc, use_original_steps=False, return_intermediates=None,
-               unconditional_guidance_scale=20.0, unconditional_conditioning=None, callback=None):
+               unconditional_guidance_scale=15.0, unconditional_conditioning=None, callback=None):
         num_reference_steps = self.ddpm_num_timesteps if use_original_steps else self.ddim_timesteps.shape[0]
 
         assert t_enc <= num_reference_steps
@@ -428,7 +428,7 @@ class DDIMSampler(object):
                 extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise)
 
     @torch.no_grad()
-    def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=20.0, unconditional_conditioning=None,
+    def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=15.0, unconditional_conditioning=None,
                use_original_steps=False, callback=None):
 
         timesteps = np.arange(self.ddpm_num_timesteps) if use_original_steps else self.ddim_timesteps
@@ -1148,15 +1148,12 @@ class CrossAttention(nn.Module):
         sim_object_std = sim_token_object.std()
         gaussian_map_norm_object = gaussian_map * (sim_object_std * beta1) + sim_object_mean
         sim_token_object.mul_(1 - gamma).add_(gamma * gaussian_map_norm_object).clamp_(0.0, 1.0)
-        # sim_token_object.mul_(1 - gamma).mul_(gamma * gaussian_map).clamp_(0.0, 1.0)
-        # sim_token_object.mul_(gamma * gaussian_map)
         
         # compute statistics for background tokens
         sim_background_mean = sim_token_background.mean()
         sim_background_std = sim_token_background.std()
         gaussian_map_norm_background = gaussian_map * (sim_background_std * beta2) + sim_background_mean
         sim_token_background.mul_(1 - gamma).add_(gamma * gaussian_map_norm_background).clamp_(0.0, 1.0)
-        # sim_token_background.mul_(gamma * gaussian_map)
 
         # Reapply attention weights if provided
         if attn_weights is not None:
@@ -1766,7 +1763,7 @@ class DDIMSamplerWithGrad(object):
                verbose=True,
                x_T=None,
                log_every_t=5,
-               unconditional_guidance_scale=20.,
+               unconditional_guidance_scale=15.,
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
@@ -1822,7 +1819,7 @@ class DDIMSamplerWithGrad(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=5,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=20., unconditional_conditioning=None, dynamic_threshold=None,
+                      unconditional_guidance_scale=15., unconditional_conditioning=None, dynamic_threshold=None,
                       ucg_schedule=None, **kwargs):
         device = self.model.betas.device
         b = shape[0]
@@ -1986,7 +1983,7 @@ class DDIMSamplerWithGrad(object):
 
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                     temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                    unconditional_guidance_scale=1., unconditional_conditioning=None,
+                    unconditional_guidance_scale=15., unconditional_conditioning=None,
                     dynamic_threshold=None, use_checkpoint=True, **kwargs):
         b, *_, device = *x.shape, x.device
         

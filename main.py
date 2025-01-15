@@ -50,7 +50,7 @@ def main(args):
     model.only_mid_control = True
     model.parameterization = args.param
     
-    strength = 5
+    strength = args.control_strength
     model.control_scales = ([strength] * 13)
     
     print(f"Using parameterization: {model.parameterization}")
@@ -141,14 +141,14 @@ def main(args):
             lr=0.01,
             ddim_steps=50,
             image_size=args.image_size,
-            unconditional_guidance_scale=15.0,
+            unconditional_guidance_scale=args.unconditional_guidance_scale,
             timestep_to_optimize=f"timestep_{args.timestep}",
             logs_dir=os.path.join(args.logs_dir, "text_optimizer"),
             optimization_steps=args.optimize_steps,
         )
         
         # Use subset of dataloader
-        num_indices = min(5, len(dataset))
+        num_indices = min(3, len(dataset))
         subset_indices = random.sample(range(len(dataset)), num_indices)
         print(f"Optimizing embeddings images: {subset_indices}")
         subset_dataset = Subset(dataset, subset_indices)
@@ -276,8 +276,8 @@ if __name__ == "__main__":
                     help="Strength of control.")
     ap.add_argument("--generate_images", action="store_true",
                     help="If set, final images will be generated at the end.")
-    ap.add_argument('--betas', type=str, default='[[50, 40], [50, 30], [50, 25], [50, 20]]', 
-                    help="List of beta pairs, e.g., '[[50, 40], [50, 30], [50, 25], [50, 20]]'")
+    ap.add_argument('--betas', type=str, default='[[50, 40], [50, 30], [50, 25]]', 
+                    help="List of beta pairs, e.g., '[[50, 40], [50, 30], [50, 25]]'")
     ap.add_argument('--spread_factor', type=float, default=4.0,
                     help="Spread factor for Gaussian map, for larger objects, recommend 2.")
     ap.add_argument('--timestep', type=int, default=30,

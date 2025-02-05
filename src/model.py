@@ -7,6 +7,7 @@ import itertools
 import wandb
 import math
 import os
+import cv2
 import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch.nn.functional as F
@@ -1819,7 +1820,7 @@ class ControlLDM(LatentDiffusion):
                 samples_cfg, intermediates = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
                 batch_size=N, ddim=use_ddim,
                 ddim_steps=ddim_steps, eta=ddim_eta,
-                unconditional_guidance_scale=15.0, # # TODO: EDIT THIS WITH GUIDANCE SCALE FOR TEXT OPTIMIZER
+                unconditional_guidance_scale=5.0, # # TODO: EDIT THIS WITH GUIDANCE SCALE FOR TEXT OPTIMIZER
                 unconditional_conditioning=uc_full,
                 **kwargs
                 )
@@ -1897,7 +1898,6 @@ class ControlledUnetModel(UNetModel):
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
         layers_to_control = [3, 4, 5]
-        # layers_to_control = [3, 4, 5, 6]
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -1911,8 +1911,8 @@ class ControlledUnetModel(UNetModel):
         if control is not None:
             h += control.pop() 
         
-        for i, module in enumerate(self.output_blocks):
-            if only_mid_control or control is None:
+        for i, module in enumerate(self.output_blocks): # there 12 blocks
+            if only_mid_control or control is None: 
                 h = torch.cat([h, hs.pop()], dim=1)
             else:
                 h1 = hs.pop() + control.pop()
@@ -2470,6 +2470,7 @@ class AttentionGuidance:
         unconditional_guidance_scale,
         betas,
         logs_dir='control_logs',
+        resize_final=False,
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -2481,6 +2482,7 @@ class AttentionGuidance:
         self.logs_dir = logs_dir
         self.prompt = prompt
         self.betas = betas
+        self.resize_final = resize_final
         
         if not os.path.exists(self.logs_dir):
             os.makedirs(self.logs_dir)
@@ -2490,7 +2492,7 @@ class AttentionGuidance:
         # clear torch cache
         torch.cuda.empty_cache()
 
-    def train(self, dataloader, original_size, num_epochs=1):
+    def train(self, dataloader, original_size, target_size, num_epochs=1):
         
         # get prompt embedding
         if isinstance(self.prompt, torch.Tensor):
@@ -2539,11 +2541,25 @@ class AttentionGuidance:
                 
                 # interpolate generated image to original size
                 original_size_flipped = (original_size[1], original_size[0])  # Flip the dimensions
-                generated = nn.functional.interpolate(generated, size=original_size_flipped, mode='bilinear', align_corners=False)
-                generated = generated.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
-                generated = (generated - generated.min()) / (generated.max() - generated.min())
-                generated = (generated * 255).astype(np.uint8)
+                generated_source_resized = nn.functional.interpolate(generated, size=original_size_flipped, mode='bilinear', align_corners=False)
+                generated_source_resized = generated_source_resized.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+                generated_source_resized = (generated_source_resized - generated_source_resized.min()) / (generated_source_resized.max() - generated_source_resized.min())
+                generated_source_resized = (generated_source_resized * 255).astype(np.uint8)
+                
+                # resize final image
+                if self.resize_final:
+                    # os.makedirs(f"{self.logs_dir}/resized", exist_ok=True)
+                    os.makedirs(f"{os.path.dirname(self.logs_dir)}/resized", exist_ok=True)
+                    target_size_flipped = (target_size[1], target_size[0])
+                    generated_target_resized = nn.functional.interpolate(generated, size=target_size_flipped, mode='bilinear', align_corners=False)
+                    generated_target_resized = generated_target_resized.cpu().detach().numpy().squeeze(0).transpose(1, 2, 0)
+                    generated_target_resized = (generated_target_resized - generated_target_resized.min()) / (generated_target_resized.max() - generated_target_resized.min())
+                    generated_target_resized = (generated_target_resized * 255).astype(np.uint8)
+                    file_name_resized = f"{os.path.dirname(self.logs_dir)}/resized/{os.path.basename(batch['source_path'][0])}"
+                    plt.imsave(file_name_resized, generated_target_resized)
                 
                 # save generated image (will only work for batch size of 1)
                 file_name = f"{self.logs_dir}/{os.path.basename(batch['source_path'][0])}"
-                plt.imsave(file_name, generated)
+                plt.imsave(file_name, generated_source_resized)
+                
+                torch.cuda.empty_cache()

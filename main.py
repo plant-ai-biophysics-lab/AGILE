@@ -1,13 +1,11 @@
 import argparse
 import os
 import torch
-import wandb
 import random
 import ast
 import pytorch_lightning as pl
 
 from pathlib import Path
-from torch import nn
 from torchvision import transforms
 from torch.utils.data import DataLoader, Subset
 
@@ -15,7 +13,7 @@ from src.util import create_model, load_state_dict, PermuteTransform, initialize
 from src.dataset import ControlNetDataset
 from src.logger import ImageLogger
 from src.model import TextEmbeddingOptimizer, AttentionGuidance
-from lightning.pytorch.loggers import WandbLogger
+from src.util import calculate_metrics
 
 # hide warnings
 import warnings
@@ -47,7 +45,7 @@ def main(args):
     print(f"Using sd_locked: {args.sd_locked}")
     model.sd_locked = args.sd_locked
     print(f"Using only_mid_control: {args.only_mid_control}")
-    model.only_mid_control = True
+    model.only_mid_control = args.only_mid_control
     model.parameterization = args.param
     
     strength = args.control_strength
@@ -84,7 +82,9 @@ def main(args):
         transform=transform,
         optimizing=args.optimize_embeddings,
         spread_factor=args.spread_factor,
-        betas=betas
+        betas=betas,
+        img_size=args.image_size,
+        use_transforms=args.use_transforms
     )
     dataloader = DataLoader(
         dataset,
@@ -93,29 +93,20 @@ def main(args):
         shuffle=True
     )
     
-    logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
-    logger.train_dataloader = dataloader
-    
-    # # prepare wandb logger
-    # wandb_logger = WandbLogger(
-    #     entity='paibl',
-    #     project='controlnet',
-    #     name=f"{args.logs_dir.name}_initial_training",
-    #     save_dir=args.logs_dir,
-    # )
-    
-    # start training
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        default_root_dir=args.logs_dir,
-        precision = 32,
-        callbacks = [logger],
-        accumulate_grad_batches=args.batch_size*4
-    )
-    trainer.fit(model, dataloader)
-    
-    # end wandb
-    # wandb.finish()
+    if not args.subset:
+        
+        logger = ImageLogger(epoch_frequency=args.logger_freq, disabled=args.generate_images)
+        logger.train_dataloader = dataloader
+        
+        # start training
+        trainer = pl.Trainer(
+            max_epochs=args.epochs,
+            default_root_dir=args.logs_dir,
+            precision = 32,
+            callbacks = [logger],
+            accumulate_grad_batches=args.batch_size*4
+        )
+        trainer.fit(model, dataloader)
     
     #######################################################
     ############### EMBEDDING OPTIMIZATION ################
@@ -123,16 +114,7 @@ def main(args):
     
     # optimize embeddings
     if args.optimize_embeddings:
-                
-        # # Set up the Wandb logger for embedding optimization
-        # wandb.init(
-        #     entity='paibl',
-        #     project='controlnet',
-        #     name=f"{args.logs_dir.name}_embedding_optimization",
-        #     dir=args.logs_dir,
-        #     resume=False
-        # )
-        
+
         # Initialize Text Embedding Optimizer
         text_optimizer = TextEmbeddingOptimizer(
             prompt=prompt,
@@ -148,7 +130,7 @@ def main(args):
         )
         
         # Use subset of dataloader
-        num_indices = min(3, len(dataset))
+        num_indices = min(5, len(dataset))
         subset_indices = random.sample(range(len(dataset)), num_indices)
         print(f"Optimizing embeddings images: {subset_indices}")
         subset_dataset = Subset(dataset, subset_indices)
@@ -161,7 +143,6 @@ def main(args):
         
         # Initialize Trainer for embedding optimization
         text_optimizer.train(optimize_dataloader, num_epochs=args.optimize_epochs)
-        # wandb.finish()
         
     #######################################################
     ################# ATTENTION GUIDANCE ##################
@@ -187,7 +168,8 @@ def main(args):
                 optimizing=args.optimize_embeddings,
                 spread_factor=args.spread_factor,
                 betas=betas,
-                generated=generated
+                generated=generated,
+                apply_bbox_mask=args.mask_bbox,
             )
             dataloader_step = DataLoader(
                 dataset_step,
@@ -196,24 +178,6 @@ def main(args):
                 shuffle=True
             )
         
-            # # TODO: REMOVE THIS DEBUG AFTER DRAFT RUNS
-            # sub_dataset = Subset(dataset, random.sample(range(len(dataset)), 100))
-            # dataloader_debug = DataLoader(
-            #     sub_dataset,
-            #     num_workers=0,
-            #     batch_size=args.batch_size,
-            #     shuffle=True
-            # )
-            
-            # # Set up the Wandb logger for embedding optimization
-            # wandb.init(
-            #     entity='paibl',
-            #     project='controlnet',
-            #     name=f"{args.logs_dir.name}_attention_guidance",
-            #     dir=args.logs_dir,
-            #     resume=False
-            # )
-            
             # get beta pairs
             betas = ast.literal_eval(args.betas)
             
@@ -226,10 +190,23 @@ def main(args):
                 ddim_steps=50,
                 unconditional_guidance_scale=args.unconditional_guidance_scale,
                 logs_dir=generated,
-                betas=betas
+                betas=betas,
+                resize_final=args.resize_final
             )
             
-            attention_guidance.train(dataloader_step, original_size=dataset.source_image_size)
+            attention_guidance.train(dataloader_step, original_size=dataset.source_image_size, target_size=dataset.target_images_size)
+            
+        #######################################################
+        ################# METRICS CALCULATION #################
+        #######################################################
+        
+        metrics = calculate_metrics(
+            real_path=args.target_images_path,
+            generated_path=generated,
+            output_dir=args.logs_dir
+        )
+        print("Metrics saved to:", os.path.join(args.logs_dir, "metrics.txt"))
+        print("Metrics:", metrics)
 
 if __name__ == "__main__":
     
@@ -282,8 +259,16 @@ if __name__ == "__main__":
                     help="Spread factor for Gaussian map, for larger objects, recommend 2.")
     ap.add_argument('--timestep', type=int, default=30,
                     help="Timestep in backward process to optimize text embedding.")
-    ap.add_argument('--unconditional_guidance_scale', type=float, default=15.0,
+    ap.add_argument('--unconditional_guidance_scale', type=float, default=5.0,
                     help="Scale for unconditional guidance.")
+    ap.add_argument('--use_transforms', action='store_true',
+                    help="If set, transforms will be used for data augmentation.")
+    ap.add_argument("--resize_final", action="store_true",
+                    help="If set, final images will be resized to target size.")
+    ap.add_argument("--subset", action="store_true",
+                    help="If set, skip training.")
+    ap.add_argument("--mask_bbox", action="store_true",
+                    help="If set, mask bounding box will be used.")
     args = ap.parse_args()
     
     main(args)

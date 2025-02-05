@@ -907,7 +907,7 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         # Split token 1 and the rest
         sim_token_1 = sim_target[:, 1:2, :, :]  # Keep as a single-channel tensor
-        sim_tokens_rest = sim_target[:, 2::2, :, :]
+        # sim_tokens_rest = sim_target[:, 2:, :, :]
 
         # Compute statistics for token 1 in-place
         sim_1_mean = sim_token_1.mean()
@@ -916,18 +916,18 @@ class MemoryEfficientCrossAttention(nn.Module):
         sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
 
         # Compute optimized Gaussian blending for tokens 2 onwards
-        selected_mean = sim_tokens_rest.mean()
-        selected_std = sim_tokens_rest.std()
-        gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
-        sim_tokens_rest.mul_(1 - gamma).add_(gamma * gaussian_map_exp_norm).clamp_(0.0, 1.0)
+        # selected_mean = sim_tokens_rest.mean()
+        # selected_std = sim_tokens_rest.std()
+        # gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
+        # sim_tokens_rest.mul_(1 - gamma).add_(gamma * gaussian_map_exp_norm).clamp_(0.0, 1.0)
 
         # Reapply attention weights if provided
-        if attn_weights is not None:
-            sim_tokens_rest.mul_(attn_weights.view(1, -1, 1, 1))
+        # if attn_weights is not None:
+        #     sim_tokens_rest.mu(l_attn_weights.view(1, -1, 1, 1))
 
         # Combine token 1 and the rest
         sim_target[:, 1:2, :, :] = sim_token_1
-        sim_target[:, 2:, :, :] = sim_tokens_rest
+        # sim_target[:, 2:, :, :] = sim_tokens_rest
 
         # Downsample to original size if needed
         if target_size != map_size:
@@ -1855,27 +1855,13 @@ class DDIMSamplerWithGrad(object):
 
                 if 'control_attentions' in kwargs:
                     kwargs['control_attentions'] = True
-                    if index >= 40:
-                        beta1 = betas[0][0]
-                        beta2 = betas[0][1]
-                        kwargs['beta1'] = beta1
-                        kwargs['beta2'] = beta2
-                    elif index > 25:
-                        beta1 = betas[1][0]
-                        beta2 = betas[1][1]
-                        kwargs['beta1'] = beta1
-                        kwargs['beta2'] = beta2
-                    elif index > 10:
-                        beta1 = betas[2][0]
-                        beta2 = betas[2][1]
-                        kwargs['beta1'] = beta1
-                        kwargs['beta2'] = beta2
-                    else:
-                        # beta1 = betas[3][0]
-                        # beta2 = betas[3][1]
-                        # kwargs['beta1'] = beta1
-                        # kwargs['beta2'] = beta2
-                        kwargs['control_attentions'] = False
+                    # if index >= 5:
+                    beta1 = betas[0][0]
+                    beta2 = betas[0][1]
+                    kwargs['beta1'] = beta1
+                    kwargs['beta2'] = beta2
+                    # else:
+                        # kwargs['control_attentions'] = False
 
                 ts = torch.full((b,), step, device=device, dtype=torch.long)
 

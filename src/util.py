@@ -2,15 +2,21 @@ import importlib
 import torch
 import math
 import os
+import cv2
+import lpips
 import numpy as np
 import torch.nn as nn
+import matplotlib.pyplot as plt
 
 from einops import repeat
+from torchvision import transforms
 from omegaconf import OmegaConf
 from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
-import matplotlib.pyplot as plt
-import cv2
+from torchvision.models import inception_v3
+from torch.nn.functional import adaptive_avg_pool2d
+from scipy.linalg import sqrtm
+from torchvision.models.feature_extraction import create_feature_extractor
 
 def initialize_weights(tensor):
     if tensor.ndimension() == 2:  # Check if the tensor is a linear layer weight
@@ -411,3 +417,122 @@ def visualize_attention_grid(agg_maps, rgb_image, column_titles, row_titles, sav
 
     # Save the figure as an image
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+def load_images_from_directory(directory, image_size=(299, 299)):
+    """
+    Loads and preprocesses images from a directory.
+
+    Args:
+        directory (str): Path to the image directory.
+        image_size (tuple): Desired image size for resizing.
+
+    Returns:
+        torch.Tensor: Tensor of preprocessed images.
+    """
+    images = []
+    preprocess = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ])
+    
+    for filename in os.listdir(directory):
+        filepath = os.path.join(directory, filename)
+        try:
+            image = Image.open(filepath).convert("RGB")  # Ensure 3 channels
+            images.append(preprocess(image))
+        except Exception as e:
+            print(f"Could not process image {filename}: {e}")
+
+    return torch.stack(images)
+
+def calculate_metrics(real_path, generated_path, output_dir, batch_size=32, device="cuda"):
+    """
+    Calculates FID and LPIPS for real and generated images and saves the results.
+
+    Args:
+        real_path (str): Path to the directory with real images.
+        generated_path (str): Path to the directory with generated images.
+        output_dir (str): Directory to save the output metrics.
+        batch_size (int): Batch size for processing images.
+        device (str): Device to run the calculations on ("cuda" or "cpu").
+
+    Returns:
+        dict: A dictionary containing the calculated metrics.
+    """
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load images
+    real_images = load_images_from_directory(real_path, image_size=(299, 299))
+    generated_images = load_images_from_directory(generated_path, image_size=(299, 299))
+
+    # Load pretrained models
+    inception_model = inception_v3(pretrained=True, transform_input=False).to(device).eval()
+    lpips_model = lpips.LPIPS(net="alex").to(device).eval()
+
+    # --- Metric Calculations ---
+
+    # 1. FID Calculation
+    def get_features(images, model):
+        """
+        Extracts features from a batch of images using the InceptionV3 model's pool3 layer.
+
+        Args:
+            images (torch.Tensor): Tensor of images with shape (N, 3, H, W).
+            model (torch.nn.Module): Pretrained InceptionV3 model for feature extraction.
+
+        Returns:
+            np.ndarray: Extracted features.
+        """
+        # Define feature extraction model to use the pool3 layer
+        feature_extractor = create_feature_extractor(model, return_nodes={"avgpool": "pool3"}).to(device)
+        features = []
+        for i in range(0, images.size(0), batch_size):
+            batch = images[i:i + batch_size].to(device)
+
+            # Normalize to [-1, 1]
+            batch = batch * 2 - 1
+
+            with torch.no_grad():
+                outputs = feature_extractor(batch)
+                preds = outputs["pool3"]
+
+            # Flatten pooled features
+            features.append(preds.squeeze(-1).squeeze(-1).cpu().numpy())
+
+        return np.concatenate(features, axis=0)
+
+    real_features = get_features(real_images, inception_model)
+    gen_features = get_features(generated_images, inception_model)
+
+    mu_real, sigma_real = np.mean(real_features, axis=0), np.cov(real_features, rowvar=False)
+    mu_gen, sigma_gen = np.mean(gen_features, axis=0), np.cov(gen_features, rowvar=False)
+
+    diff = mu_real - mu_gen
+    covmean, _ = sqrtm(sigma_real @ sigma_gen, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = diff @ diff + np.trace(sigma_real + sigma_gen - 2 * covmean)
+
+    # 2. LPIPS Calculation
+    lpips_scores = []
+    for i in range(min(len(real_images), len(generated_images))):
+        with torch.no_grad():
+            score = lpips_model(real_images[i].unsqueeze(0).to(device),
+                                generated_images[i].unsqueeze(0).to(device))
+            lpips_scores.append(score.item())
+    lpips_mean = np.mean(lpips_scores)
+
+    # Metrics dictionary
+    metrics = {
+        "FID": fid,
+        "LPIPS": lpips_mean,
+    }
+
+    # Save metrics to a text file
+    output_file = os.path.join(output_dir, "metrics.txt")
+    with open(output_file, "w") as f:
+        for key, value in metrics.items():
+            f.write(f"{key}: {value:.4f}\n")
+
+    return metrics

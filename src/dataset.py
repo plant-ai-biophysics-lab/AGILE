@@ -1,14 +1,15 @@
 import os
 import random
 import numpy as np
-import matplotlib.pyplot as plt
+import albumentations as A
 
 from torch.utils.data import Dataset
 from PIL import Image
 
 class ControlNetDataset(Dataset):
     def __init__(
-        self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, spread_factor=4.0, betas=None, generated=None
+        self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, 
+        spread_factor=4.0, betas=None, generated=None, img_size=512, use_transforms=False, apply_bbox_mask=False
     ):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
@@ -18,6 +19,9 @@ class ControlNetDataset(Dataset):
         self.spread_factor = spread_factor
         self.betas=betas
         self.generated = generated
+        self.img_size = img_size
+        self.use_transforms = use_transforms
+        self.apply_bbox_mask = apply_bbox_mask
         
         # Load image file paths
         if self.generated is not None:
@@ -44,6 +48,111 @@ class ControlNetDataset(Dataset):
         # get original source image size
         source_image = Image.open(os.path.join(self.source_images_path, self.source_image_files[0])).convert("RGB")
         self.source_image_size = source_image.size
+        target_image = Image.open(os.path.join(self.target_images_path, self.target_image_files[0])).convert("RGB")
+        self.target_images_size = target_image.size
+        
+        self.geometric_augmentation = A.Compose([
+            A.RandomCrop(height=int(self.img_size * 0.8), width=int(self.img_size * 0.8), p=1.0),
+            A.Resize(self.img_size, self.img_size)  
+        ], additional_targets={"image0": "image"})
+        self.color_augmentation = A.Compose([
+            A.RandomBrightnessContrast(brightness_limit=(-0.4, 0.2), contrast_limit=(-0.4, 0.2), p=0.8),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.5)
+        ])
+        
+    @staticmethod
+    def read_yolo_labels(label_path, img_width, img_height):
+        """
+        Reads YOLO labels and converts them to absolute pixel bounding boxes.
+        
+        Args:
+            label_path (str): Path to the YOLO label file (.txt).
+            img_width (int): Width of the image.
+            img_height (int): Height of the image.
+
+        Returns:
+            list of tuples: List of bounding boxes in absolute pixel format (x_min, y_min, x_max, y_max).
+        """
+        bboxes = []
+        with open(label_path, "r") as file:
+            for line in file.readlines():
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                class_id, x_center, y_center, width, height = map(float, parts)
+                x_min = int((x_center - width / 2) * img_width)
+                y_min = int((y_center - height / 2) * img_height)
+                x_max = int((x_center + width / 2) * img_width)
+                y_max = int((y_center + height / 2) * img_height)
+                bboxes.append((x_min, y_min, x_max, y_max))
+        return bboxes
+    
+    def mask_bbox(self, image, yolo_file):
+        """
+        Applies a white mask over the bounding box areas specified in the YOLO label file.
+
+        Args:
+            image (np.array): The input image.
+            yolo_file (str): Path to the YOLO label file.
+
+        Returns:
+            np.array: The masked image.
+        """
+        img_array = np.array(image).astype(np.uint8)
+        img_height, img_width = img_array.shape[:2]
+
+        bboxes = self.read_yolo_labels(yolo_file, img_width, img_height)
+
+        for x_min, y_min, x_max, y_max in bboxes:
+            img_array[y_min:y_max, x_min:x_max] = 255  # Apply white mask
+            
+        # TEMP: Save masked image for debugging
+        Image.fromarray(img_array).save("masked_output.jpg")
+        print("Masked image saved as 'masked_output.jpg'")
+
+        return img_array
+        
+    def random_mask(self, image):
+        """
+        Randomly masks out 3 regions of the image with rectangular boxes.
+
+        Args:
+            image (np.array): The input image (expected in [-1,1] normalized format).
+            label_path (str): Path to the YOLO label file (not used anymore).
+
+        Returns:
+            np.array: The masked image in the same format as the input.
+        """
+        # # De-normalize image from [-1,1] back to [0,255]
+        # img_array = ((image + 1.0) * 127.5).astype(np.uint8)
+        img_array = np.array(image).astype(np.uint8)
+
+        img_height, img_width = img_array.shape[:2]
+
+        # Define the number of random masks
+        num_masks = 3
+        max_mask_size = (img_width // 4, img_height // 4)  # Maximum size of each mask
+
+        for _ in range(num_masks):
+            # Randomly select a position for the mask
+            x_min = random.randint(0, img_width - max_mask_size[0])
+            y_min = random.randint(0, img_height - max_mask_size[1])
+
+            # Randomly determine the box size (ensuring it doesn't exceed max_mask_size)
+            box_width = random.randint(max_mask_size[0] // 2, max_mask_size[0])
+            box_height = random.randint(max_mask_size[1] // 2, max_mask_size[1])
+
+            x_max = min(img_width, x_min + box_width)
+            y_max = min(img_height, y_min + box_height)
+
+            # Apply hard mask (white) to the randomly chosen bounding box
+            img_array[y_min:y_max, x_min:x_max] = 255  # Set to white (255)
+
+        # # TEMP: Save masked image for debugging
+        # Image.fromarray(img_array).save("masked_output.jpg")
+        # print("Masked image saved as 'masked_output.jpg'")
+
+        return img_array
     
     def balance_dataset_lengths(self):
         if len(self.source_image_files) < len(self.target_image_files):
@@ -116,17 +225,6 @@ class ControlNetDataset(Dataset):
         foreground_map = Image.fromarray((foreground_map * 255).astype(np.uint8))
         background_map = Image.fromarray((background_map * 255).astype(np.uint8))
         
-        # # Save the maps using the viridis colormap
-        # def save_debug_image(data, filename):
-        #     plt.imshow(data, cmap='viridis')
-        #     plt.colorbar()
-        #     plt.savefig(filename)
-        #     plt.close()
-        
-        # save_debug_image(foreground_map, 'foreground_map_debug.png')
-        # save_debug_image(background_map, 'background_map_debug.png')
-        # save_debug_image(attention_map, 'attention_map_debug.png')  # Save the combined map too
-        
         return {'object': foreground_map, 'background': background_map}
     
     def __len__(self):
@@ -163,10 +261,6 @@ class ControlNetDataset(Dataset):
             target_image = self.transform(target_image)
             attn_map['object'] = self.transform(attn_map['object'])
             attn_map['background'] = self.transform(attn_map['background'])
-            
-        # Normalize images
-        source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
-        target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
         
         # Normalize attention map between 0 and 1
         attn_map['object'] = np.array(attn_map['object']).astype(np.float32) / 255.0
@@ -174,9 +268,34 @@ class ControlNetDataset(Dataset):
         
         if self.optimizing:
             target_image = source_image
+            
+            # Normalize images
+            source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
+            target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
+            
         else:
             source_image = target_image
+            
+            if self.use_transforms:
+                source_image_np = np.array(source_image)
+                target_image_np = np.array(target_image)
 
+                transformed = self.geometric_augmentation(image=source_image_np, image0=target_image_np)
+                source_image = transformed["image"]
+                target_image = transformed["image0"]
+                source_image = self.color_augmentation(image=source_image)["image"]
+
+                # Apply Masking AFTER Augmentation
+                source_image = self.random_mask(source_image)
+                
+            ## TODO: ADD MASK BBOX HERE IF TRUE
+            if self.apply_bbox_mask:
+                source_image = self.mask_bbox(source_image, yolo_file)
+                
+            # Normalize images
+            source_image = np.array(source_image).astype(np.float32) / 127.5 - 1.0
+            target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
+            
         return dict(
             jpg=target_image,
             txt=prompt,

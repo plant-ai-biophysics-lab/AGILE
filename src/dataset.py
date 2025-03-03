@@ -1,15 +1,19 @@
 import os
 import random
+import torch
+import cv2
 import numpy as np
 import albumentations as A
 
+from transformers import SamModel, SamProcessor
 from torch.utils.data import Dataset
 from PIL import Image
 
 class ControlNetDataset(Dataset):
     def __init__(
         self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, 
-        spread_factor=4.0, betas=None, generated=None, img_size=512, use_transforms=False, apply_bbox_mask=False
+        spread_factor=4.0, betas=None, generated=None, img_size=512, use_transforms=False, apply_bbox_mask=False,
+        device="cuda"
     ):
         self.source_images_path = source_images_path
         self.target_images_path = target_images_path
@@ -22,6 +26,11 @@ class ControlNetDataset(Dataset):
         self.img_size = img_size
         self.use_transforms = use_transforms
         self.apply_bbox_mask = apply_bbox_mask
+        self.device = device
+        
+        # sam
+        self.processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+        self.model = SamModel.from_pretrained("facebook/sam-vit-base").to(self.device)
         
         # Load image file paths
         if self.generated is not None:
@@ -32,7 +41,7 @@ class ControlNetDataset(Dataset):
             self.target_image_files = [f for f in os.listdir(target_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
         
         # Balance the dataset lengths
-        self.balance_dataset_lengths()
+        self.balance_dataset_lengths(method="oversample")
         
         # Create dataset structure
         self.data = []
@@ -52,8 +61,9 @@ class ControlNetDataset(Dataset):
         self.target_images_size = target_image.size
         
         self.geometric_augmentation = A.Compose([
-            A.RandomCrop(height=int(self.img_size * 0.8), width=int(self.img_size * 0.8), p=1.0),
-            A.Resize(self.img_size, self.img_size)  
+            # A.Affine(shear=(-30, 30), keep_ratio=False, cval=255, p=0.5),
+            A.RandomCrop(height=int(self.img_size * 0.8), width=int(self.img_size * 0.8), p=0.8),
+            A.Resize(self.img_size, self.img_size)
         ], additional_targets={"image0": "image"})
         self.color_augmentation = A.Compose([
             A.RandomBrightnessContrast(brightness_limit=(-0.4, 0.2), contrast_limit=(-0.4, 0.2), p=0.8),
@@ -84,31 +94,32 @@ class ControlNetDataset(Dataset):
                 y_min = int((y_center - height / 2) * img_height)
                 x_max = int((x_center + width / 2) * img_width)
                 y_max = int((y_center + height / 2) * img_height)
-                bboxes.append((x_min, y_min, x_max, y_max))
+                bboxes.append([x_min, y_min, x_max, y_max])
         return bboxes
     
     def mask_bbox(self, image, yolo_file):
         """
-        Applies a white mask over the bounding box areas specified in the YOLO label file.
-
-        Args:
-            image (np.array): The input image.
-            yolo_file (str): Path to the YOLO label file.
-
-        Returns:
-            np.array: The masked image.
+        Uses SAM to mask objects inside bounding boxes.
         """
         img_array = np.array(image).astype(np.uint8)
         img_height, img_width = img_array.shape[:2]
 
-        bboxes = self.read_yolo_labels(yolo_file, img_width, img_height)
-
-        for x_min, y_min, x_max, y_max in bboxes:
-            img_array[y_min:y_max, x_min:x_max] = 255  # Apply white mask
+        bboxes = self.read_yolo_labels(yolo_file, img_width, img_height)     
+        input_boxes = [[list(map(float, bbox)) for bbox in bboxes]]
+        inputs = self.processor(images=image, input_boxes=input_boxes, return_tensors="pt").to(self.device)
+        
+        outputs = self.model(**inputs, multimask_output=False)
+        masks = torch.sigmoid(outputs.pred_masks.squeeze(0)[:, 0]).detach().cpu().numpy()
+        
+        for mask in masks:
+            mask_resized = cv2.resize(mask, (img_width, img_height), interpolation=cv2.INTER_LINEAR)
+            mask_bool = mask_resized > 0.5
+        
+            img_array[mask_bool] = 255  # Apply mask
             
-        # TEMP: Save masked image for debugging
-        Image.fromarray(img_array).save("masked_output.jpg")
-        print("Masked image saved as 'masked_output.jpg'")
+        # # TEMP: Save masked image for debugging
+        # Image.fromarray(img_array).save("masked_output.jpg")
+        # print("Masked image saved as 'masked_output.jpg'")
 
         return img_array
         
@@ -154,13 +165,28 @@ class ControlNetDataset(Dataset):
 
         return img_array
     
-    def balance_dataset_lengths(self):
-        if len(self.source_image_files) < len(self.target_image_files):
-            deficit = len(self.target_image_files) - len(self.source_image_files)
-            self.source_image_files += random.choices(self.source_image_files, k=deficit)
-        elif len(self.target_image_files) < len(self.source_image_files):
-            deficit = len(self.source_image_files) - len(self.target_image_files)
-            self.target_image_files += random.choices(self.target_image_files, k=deficit)
+    def balance_dataset_lengths(self, method="undersample"):
+        """
+        Balances the dataset lengths by either oversampling the smaller set or undersampling the larger set.
+
+        :param method: "oversample" to duplicate entries in the smaller set,
+                    "undersample" to reduce entries in the larger set (default: "undersample").
+        """
+        source_len = len(self.source_image_files)
+        target_len = len(self.target_image_files)
+        min_length = min(source_len, target_len)
+        max_length = max(source_len, target_len)
+
+        if method == "oversample":
+            if source_len < target_len:
+                self.source_image_files += random.choices(self.source_image_files, k=target_len - source_len)
+            elif target_len < source_len:
+                self.target_image_files += random.choices(self.target_image_files, k=source_len - target_len)
+        elif method == "undersample":
+            self.source_image_files = random.sample(self.source_image_files, min_length)
+            self.target_image_files = random.sample(self.target_image_files, min_length)
+        else:
+            raise ValueError("Invalid method. Choose 'oversample' or 'undersample'.")
    
     def gaussian_map(self, image, yolo_file):
         # Create an empty attention map

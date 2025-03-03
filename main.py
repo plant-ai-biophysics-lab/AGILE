@@ -200,9 +200,13 @@ def main(args):
         ################# METRICS CALCULATION #################
         #######################################################
         
+        # replace train in args.target_images_path with 'test'
+        args.target_images_path = str(args.target_images_path).replace('train', 'test')
+        
         metrics = calculate_metrics(
             real_path=args.target_images_path,
-            generated_path=generated,
+            # generated_path=generated,
+            generated_path="/group/jmearlesgrp/intermediate_data/eranario/AGILE/flower_syn2real/cropgan/0225_cropgan",
             output_dir=args.logs_dir
         )
         print("Metrics saved to:", os.path.join(args.logs_dir, "metrics.txt"))

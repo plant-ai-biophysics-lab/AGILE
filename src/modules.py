@@ -907,19 +907,21 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         # Split token 1 and the rest
         sim_token_1 = sim_target[:, 1:2, :, :]  # Keep as a single-channel tensor
-        # sim_tokens_rest = sim_target[:, 2:, :, :]
+        sim_tokens_rest = sim_target[:, 2:, :, :]
 
         # Compute statistics for token 1 in-place
         sim_1_mean = sim_token_1.mean()
         sim_1_std = sim_token_1.std()
         gaussian_map_norm = gaussian_map * (sim_1_std * beta1) + sim_1_mean
-        sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
+        # sim_token_1.mul_(1 - gamma).add_(gamma * gaussian_map_norm).clamp_(0.0, 1.0)
+        sim_token_1.mul(gaussian_map_norm)
 
         # Compute optimized Gaussian blending for tokens 2 onwards
-        # selected_mean = sim_tokens_rest.mean()
-        # selected_std = sim_tokens_rest.std()
-        # gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
+        selected_mean = sim_tokens_rest.mean()
+        selected_std = sim_tokens_rest.std()
+        gaussian_map_exp_norm = gaussian_map * (selected_std * beta2) + selected_mean
         # sim_tokens_rest.mul_(1 - gamma).add_(gamma * gaussian_map_exp_norm).clamp_(0.0, 1.0)
+        sim_tokens_rest.mul(gaussian_map_exp_norm)
 
         # Reapply attention weights if provided
         # if attn_weights is not None:
@@ -927,7 +929,7 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         # Combine token 1 and the rest
         sim_target[:, 1:2, :, :] = sim_token_1
-        # sim_target[:, 2:, :, :] = sim_tokens_rest
+        sim_target[:, 2:, :, :] = sim_tokens_rest
 
         # Downsample to original size if needed
         if target_size != map_size:
@@ -1148,12 +1150,14 @@ class CrossAttention(nn.Module):
         sim_object_std = sim_token_object.std()
         gaussian_map_norm_object = gaussian_map * (sim_object_std * beta1) + sim_object_mean
         sim_token_object.mul_(1 - gamma).add_(gamma * gaussian_map_norm_object).clamp_(0.0, 1.0)
+        # sim_token_object.mul(gaussian_map_norm_object)
         
         # compute statistics for background tokens
         sim_background_mean = sim_token_background.mean()
         sim_background_std = sim_token_background.std()
         gaussian_map_norm_background = gaussian_map * (sim_background_std * beta2) + sim_background_mean
         sim_token_background.mul_(1 - gamma).add_(gamma * gaussian_map_norm_background).clamp_(0.0, 1.0)
+        # sim_token_background.mul(gaussian_map_norm_background)
 
         # Reapply attention weights if provided
         if attn_weights is not None:
@@ -1855,13 +1859,13 @@ class DDIMSamplerWithGrad(object):
 
                 if 'control_attentions' in kwargs:
                     kwargs['control_attentions'] = True
-                    # if index >= 5:
-                    beta1 = betas[0][0]
-                    beta2 = betas[0][1]
-                    kwargs['beta1'] = beta1
-                    kwargs['beta2'] = beta2
-                    # else:
-                        # kwargs['control_attentions'] = False
+                    if index >= 5:
+                        beta1 = betas[0][0]
+                        beta2 = betas[0][1]
+                        kwargs['beta1'] = beta1
+                        kwargs['beta2'] = beta2
+                    else:
+                        kwargs['control_attentions'] = False
 
                 ts = torch.full((b,), step, device=device, dtype=torch.long)
 

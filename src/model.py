@@ -1150,9 +1150,6 @@ class LatentDiffusion(DDPM):
             model_output = self.apply_model(x_noisy, t, cond, save_attention=False, optimizing=False,
                                                        control_attentions=True, gaussian_map=kwargs['attn_map'],
                                                        beta1=betas[3][0], beta2=betas[3][1])
-            # return self.model.apply_model(x_in, t_in, c_in, 
-            #                 save_attention=True, optimizing=False, control_attentions=True, gaussian_map=gaussian_map, background_map=background_map, attn_weights=a_vector, beta1=beta1, beta2=beta2
-            #             )
         else:
             model_output = self.apply_model(x_noisy, t, cond)
 
@@ -1898,6 +1895,7 @@ class ControlledUnetModel(UNetModel):
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
         layers_to_control = [3, 4, 5]
+        # layers_to_control = []
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)

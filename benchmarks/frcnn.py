@@ -297,24 +297,12 @@ def main(
     else:
         transform_train = A.Compose([
             A.OneOf([
-                A.PadIfNeeded(
-                    min_height=int(gen_height * 2.5),
-                    min_width=int(gen_width * 2.5),
-                    border_mode=cv2.BORDER_CONSTANT,
-                    value=0,
-                    p=0.5
-                ),  # shrink (zoom out)
-                A.PadIfNeeded(
-                    min_height=int(gen_height * 1.5),
-                    min_width=int(gen_width * 1.5),
-                    border_mode=cv2.BORDER_CONSTANT,
-                    value=0,
-                    p=0.5
-                ),  # enlarge (zoom in)
+                A.RandomResizedCrop(height=orig_height, width=orig_width, scale=(0.4, 0.8), ratio=(0.9, 1.1), p=0.5),  # random crop (zoom in)
+                A.PadIfNeeded(min_height=int(gen_height * 1.3), min_width=int(gen_width * 1.3), border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),  # shrink (zoom out)
             ], p=1.0),
             A.Resize(height=orig_height, width=orig_width, p=1.0), # maintain aspect ratio
             A.PadIfNeeded(min_height=orig_height, min_width=orig_height, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0), # square
-            A.Resize(height=512, width=512, p=1.0), # resize for model input
+            A.Resize(height=image_size, width=image_size, p=1.0), # resize for model input
             ToTensorV2()
         ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
         

@@ -3,6 +3,7 @@ import os
 import math
 import wandb
 import time
+import random
 import numpy as np
 import torch.nn.functional as F
 import torchvision.utils as vutils
@@ -1852,6 +1853,11 @@ class DDIMSamplerWithGrad(object):
 
             betas = kwargs['betas']
             
+            # ### NOTE FOR DEBUGGING NOTE ###
+            # timesteps_to_display = [49, 30, 20, 10, 0]
+            # grid_images = np.zeros((1, len(timesteps_to_display), 3, 512, 512))  # 1 row, 6 columns, 3 channels, 512x512
+            # ### NOTE FOR DEBUGGING NOTE ###
+            
             # for opt_step in range(opt_steps):
             for i, step in enumerate(iterator):
 
@@ -1859,7 +1865,7 @@ class DDIMSamplerWithGrad(object):
 
                 if 'control_attentions' in kwargs:
                     kwargs['control_attentions'] = True
-                    if index >= 5:
+                    if index >= kwargs['stop_editing']:
                         beta1 = betas[0][0]
                         beta2 = betas[0][1]
                         kwargs['beta1'] = beta1
@@ -1893,49 +1899,20 @@ class DDIMSamplerWithGrad(object):
                         intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
                     
             #     ### NOTE FOR DEBUGGING NOTE ###
-            #         # Check if `index` is in `timesteps_to_display`
-            #         if index in timesteps_to_display:
-            #             timestep_index = timesteps_to_display.index(index)
-            #             img_decoded = self.model.decode_first_stage(img)
-            #             grid_images[opt_step][timestep_index] = img_decoded  # Store in prefilled grid for selected timesteps
-                        
-            #             # Save the corresponding `prompt_map` in the prompt_map_grid if in last opt_step
-            #             if opt_step == opt_steps - 1:
-                            
-            #                 # get tokens to display from avg_attn_maps
-            #                 display_avg_attn_maps = self.parse_attn_maps(attn_maps)
-            #                 tokens_to_display_avg = display_avg_attn_maps[:, :, tokens_to_display]
-            #                 for i, _ in enumerate(tokens_to_display):
-            #                     token_colored = self.apply_viridis_colormap(tokens_to_display_avg[:, :, i])
-            #                     prompt_map_grid[i][timestep_index] = token_colored
-                    
-            #     # Add source_img and target_map at the end of each row
-            #     grid_images[opt_step][-1] = source_img.squeeze(0).permute(2, 0, 1)  # Add source image at the end of the row in the normal grid
-            #     ### NOTE FOR DEBUGGING NOTE ###
-                
-            #     ### NOTE FOR DEBUGGING NOTE ###
-            #     # Reset img
-            #     if x_T is None:
-            #         img = torch.randn(shape, device=device)
-            #     else:
-            #         img = x_T
-            #     kwargs['control_attentions'] = True
-            #     print('Setting control attentions back to True')
-            #     iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
-            #     ### NOTE FOR DEBUGGING NOTE ###
+            #     # Check if `index` is in `timesteps_to_display`
+            #     if index in timesteps_to_display:
+            #         timestep_index = timesteps_to_display.index(index)
+            #         img_decoded = self.model.decode_first_stage(img)
+            #         grid_images[:,timestep_index,:,:,:] = img_decoded.cpu()  # Store in prefilled grid for selected timesteps
 
-            #  ### NOTE FOR DEBUGGING NOTE ###
+            # ### NOTE FOR DEBUGGING NOTE ###
             # # Generate the image grid from the prefilled array for both normal images and prompt maps
-            # opt_step_titles = [f'Step {i + 1}' for i in range(opt_steps)]  # Row titles
             
-            #  # Save normal image grid
-            # rgb_img_dir = os.path.join(logs_dir, 'rgb_images')
-            # self.create_image_grid_prefilled(grid_images, opt_steps, num_timesteps_to_display + 1, rgb_img_dir, timesteps_to_display + ["Source"], opt_step_titles, batch_idx=batch_idx, target_map=target_map, final_img=None)
-            
-            # # Save prompt map grid
-            # attn_map_dir = os.path.join(logs_dir, 'attn_maps')
-            # self.create_prompt_map_grid_prefilled(prompt_map_grid, len(tokens_to_display), num_timesteps_to_display, attn_map_dir, timesteps_to_display, tokens_to_display, batch_idx)
-            #  ### NOTE FOR DEBUGGING NOTE ###
+            # # Save normal image grid
+            # rgb_img_dir = os.path.join(kwargs['logs_dir'], 'rgb_images')
+            # batch_idx = random.randint(0, 1000)
+            # self.create_image_grid_prefilled(grid_images, len(timesteps_to_display), rgb_img_dir, timesteps_to_display, batch_idx)
+            # #  ### NOTE FOR DEBUGGING NOTE ###
             
         else:
             kwargs['optimizing'] = True
@@ -2125,29 +2102,23 @@ class DDIMSamplerWithGrad(object):
         return attn_map_colored
         
     @staticmethod
-    def create_image_grid_prefilled(images_grid, rows, cols, logs_dir, timesteps, opt_steps, batch_idx, target_map=None, final_img=None):
+    def create_image_grid_prefilled(images_grid, cols, logs_dir, timesteps, batch_idx):
 
         # Determine the device (if all tensors should be on the same GPU or CPU)
-        device = images_grid[0][0].device if images_grid[0][0] is not None else 'cpu'
+        # device = images_grid[0][0].device if images_grid[0][0] is not None else 'cpu'
 
         # Create a flat list of images from the prefilled grid for stacking
         processed_images = []
         for row in images_grid:
             for img in row:
                 if img is not None:
-                    img = img.to(device)
-                    # Remove batch dimension if present
-                    if img.dim() == 4 and img.shape[0] == 1:  
-                        img = img.squeeze(0)  # Now img is [3, 512, 512] or [1, 512, 512]
-                    # If the image is grayscale (1 channel), convert it to 3 channels
-                    if img.shape[0] == 1:  
-                        img = img.repeat(3, 1, 1)  # Convert grayscale to RGB
+                    img = torch.tensor(img)  # Convert to tensor if needed
+                    img = (img - img.min()) / (img.max() - img.min() + 1e-8)  # Normalize per image
                     processed_images.append(img)
-                else:
-                    processed_images.append(torch.zeros(3, 512, 512).to(device))  # Placeholder for missing images
 
-        # Stack the images into a single tensor
-        grid_img = vutils.make_grid(torch.stack(processed_images), nrow=cols, padding=2, normalize=True)
+        # convert numpy array to tensor and stack
+        processed_images = torch.stack(processed_images)
+        grid_img = vutils.make_grid(processed_images, nrow=cols, padding=2, normalize=False)
 
         # Create the logs directory if it doesn't exist
         if not os.path.exists(logs_dir):
@@ -2162,10 +2133,6 @@ class DDIMSamplerWithGrad(object):
         for col in range(cols):
             plt.text(col * grid_img.shape[2] // cols + grid_img.shape[2] // (2 * cols),
                     -10, f'Timestep {timesteps[col]}', ha='center', va='bottom', fontsize=10, color='black')
-
-        for row in range(rows):
-            plt.text(-20, row * grid_img.shape[1] // rows + grid_img.shape[1] // (2 * rows),
-                    f'Opt Step {opt_steps[row]}', ha='right', va='center', fontsize=10, color='black')
 
         # Save the grid image with row and column titles
         save_path = os.path.join(logs_dir, f"batch_idx_{batch_idx}.png")

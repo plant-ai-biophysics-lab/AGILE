@@ -9,7 +9,7 @@ import shutil
 from ultralytics import YOLO
 from pathlib import Path
 from typing import List
-
+     
 def edit_data(
     data: Path,
     new_path: dict
@@ -135,10 +135,12 @@ def main(
     epochs: int,
     batch_size: int,
     run_name: str,
-    symlink_temp: str
+    symlink_temp: str,
+    model_type: str
 ) -> None:
     
     try:
+        
         # get train, val and test images/labels
         path_source_train = source_images / 'train' if (source_images / 'train').exists() else source_images
         path_target_val = target_images / 'val' if (target_images / 'val').exists() else target_images
@@ -158,72 +160,73 @@ def main(
         create_symlink(path_target_test / 'images', save / symlink_temp / 'images/test')
         create_symlink(path_target_test / 'labels', save / symlink_temp / 'labels/test')
 
-        # edit data.yaml file with update path to images
-        new_path: dict = {
-            'path': str(save / symlink_temp),
-            'names': labels,
-            'nc': len(labels),
-            'train': 'images/train',
-            'val': 'images/val'
-        }
-        edit_data(data, new_path)
-        
-        # initialize project and update config
-        config = load_yaml_config(config_file=config_path)
-        version = generate_hash()
-        while (save / run_name / Path(f'{version}')).exists():
+        if model_type == 'yolo':
+            
+            # edit data.yaml file with update path to images
+            new_path: dict = {
+                'path': str(save / symlink_temp),
+                'names': labels,
+                'nc': len(labels),
+                'train': 'images/train',
+                'val': 'images/val'
+            }
+            edit_data(data, new_path)
+            
+            # initialize project and update config
+            config = load_yaml_config(config_file=config_path)
             version = generate_hash()
-        name = f'{version}'
-        new_values: dict = {
-            'batch': batch_size,
-            'epochs': epochs,
-            'imgsz': image_size,
-            'project': f'{save}/{run_name}_{version}',
-            'name': name,
-            'data': str(data),
-            'model': str(pretrained)
-        }
-        config.update(new_values)
-        with open(config_path, 'w') as file:
-            yaml.dump(config, file)
-        
-        # load pretrained model
-        model = YOLO(pretrained)
+            while (save / run_name / Path(f'{version}')).exists():
+                version = generate_hash()
+            name = f'{version}'
+            new_values: dict = {
+                'batch': batch_size,
+                'epochs': epochs,
+                'imgsz': image_size,
+                'project': f'{save}/{run_name}_{version}',
+                'name': name,
+                'data': str(data),
+                'model': str(pretrained)
+            }
+            config.update(new_values)
+            with open(config_path, 'w') as file:
+                yaml.dump(config, file)
+            
+            # load pretrained model
+            model = YOLO(pretrained)
 
-        # train the model
-        train_params = {
-            **config,
-        }
-        model.train(**train_params)
+            # train the model
+            train_params = {
+                **config
+            }
+            model.train(**train_params)
 
-        # export the model
-        model.export()
-        
-        # test the model
-        new_path: dict = {
-            'val': 'images/test'
-        }
-        edit_data(data, new_path)
-        model = YOLO(f'{save}/{run_name}_{version}/{version}/weights/best.pt')
-        metrics = model.val(
-            save_json=True,
-            batch=config['batch'],
-            imgsz=config['imgsz'],
-            workers=config['workers'],
-            plots=True,
-            project=config['project'],
-            name='test',
-            iou=0.3,
-            conf=0.00001
-        )
-        
-        # save full metrics to file
-        with open(f'{save}/{run_name}_{version}/test/metrics.txt', 'w') as file:
-            file.write(str(metrics))
-        
-        # remove existing symlinks
-        if (save / symlink_temp).exists():
-            shutil.rmtree(save / symlink_temp)
+            # export the model
+            model.export()
+            
+            # test the model
+            new_path: dict = {
+                'val': 'images/test'
+            }
+            edit_data(data, new_path)
+            model = YOLO(f'{save}/{run_name}_{version}/{version}/weights/best.pt')
+            metrics = model.val(
+                save_json=True,
+                batch=config['batch'],
+                imgsz=config['imgsz'],
+                workers=config['workers'],
+                plots=True,
+                project=config['project'],
+                name='test',
+                iou=0.1,
+            )
+            
+            # save full metrics to file
+            with open(f'{save}/{run_name}_{version}/test/metrics.txt', 'w') as file:
+                file.write(str(metrics))
+            
+            # remove existing symlinks
+            if (save / symlink_temp).exists():
+                shutil.rmtree(save / symlink_temp)
     
     except Exception as e:
         # remove existing symlinks
@@ -235,8 +238,8 @@ def main(
 if __name__ == '__main__':
     
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pretrained', type=Path, required=True,
-                    help='Path to pretrained YOLOv8 weights')
+    ap.add_argument('--pretrained', type=Path,
+                    help='Path to pretrained YOLO weights')
     ap.add_argument('--source-images', type=Path, required=True,
                     help='Path to training and validation dataset')
     ap.add_argument('--target-images', type=Path, required=True,
@@ -257,6 +260,8 @@ if __name__ == '__main__':
                     help='Name of the run.')
     ap.add_argument('--symlink-temp', type=str, default='temp',
                     help='Name of the run.')
+    ap.add_argument('--model_type', type=str, default='yolo',
+                    help='Type of model to train.')
     args = ap.parse_args()
     
     # set path to directory of script
@@ -273,4 +278,4 @@ if __name__ == '__main__':
     
     main(args.pretrained, args.source_images, args.target_images, args.generated_images, \
          config, data, args.save, args.labels, args.image_size, args.epochs, args.batch_size, \
-             args.run_name, args.symlink_temp)
+             args.run_name, args.symlink_temp, args.model_type)

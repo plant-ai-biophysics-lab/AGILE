@@ -1894,8 +1894,8 @@ class ControlledUnetModel(UNetModel):
         # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
-        layers_to_control = [3, 4, 5]
-        # layers_to_control = []
+        # layers_to_control = [3, 4, 5]
+        layers_to_control = []
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -2469,6 +2469,7 @@ class AttentionGuidance:
         betas,
         logs_dir='control_logs',
         resize_final=False,
+        stop_editing=5,
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -2481,6 +2482,7 @@ class AttentionGuidance:
         self.prompt = prompt
         self.betas = betas
         self.resize_final = resize_final
+        self.stop_editing = stop_editing
         
         if not os.path.exists(self.logs_dir):
             os.makedirs(self.logs_dir)
@@ -2532,7 +2534,8 @@ class AttentionGuidance:
                     logs_dir=self.logs_dir,
                     source_img=batch['hint'],
                     betas=self.betas,
-                    background_map=background_map
+                    background_map=background_map,
+                    stop_editing=self.stop_editing
                 )
                 
                 generated = self.model.decode_first_stage(generated)

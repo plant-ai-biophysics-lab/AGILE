@@ -4,3 +4,4 @@ scripts/active-learning/farm/
 farm
 /scripts/controlnet/src/__pycache__/*
 /scripts/controlnetplus/src/__pycache__/*
+benchmarks/cyclegan_turbo/wandb/*

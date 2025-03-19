@@ -1894,8 +1894,8 @@ class ControlledUnetModel(UNetModel):
         # Layers with attention: 3, 4, 5, 6, 7, 8, 9, 10, 11
         hs = []
         layers_to_save = [3, 4, 5, 6, 7, 8, 9, 10, 11]
-        # layers_to_control = [3, 4, 5]
-        layers_to_control = []
+        layers_to_control = [3, 4, 5]
+        # layers_to_control = []
         attn_maps_layer = {}
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)

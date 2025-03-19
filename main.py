@@ -191,7 +191,8 @@ def main(args):
                 unconditional_guidance_scale=args.unconditional_guidance_scale,
                 logs_dir=generated,
                 betas=betas,
-                resize_final=args.resize_final
+                resize_final=args.resize_final,
+                stop_editing=args.stop_editing
             )
             
             attention_guidance.train(dataloader_step, original_size=dataset.source_image_size, target_size=dataset.target_images_size)
@@ -205,8 +206,7 @@ def main(args):
         
         metrics = calculate_metrics(
             real_path=args.target_images_path,
-            # generated_path=generated,
-            generated_path="/group/jmearlesgrp/intermediate_data/eranario/AGILE/flower_syn2real/cropgan/0225_cropgan",
+            generated_path=generated,
             output_dir=args.logs_dir
         )
         print("Metrics saved to:", os.path.join(args.logs_dir, "metrics.txt"))
@@ -273,6 +273,8 @@ if __name__ == "__main__":
                     help="If set, skip training.")
     ap.add_argument("--mask_bbox", action="store_true",
                     help="If set, mask bounding box will be used.")
+    ap.add_argument("--stop_editing", type=int, default=5,
+                    help="Stop editing at the timestep for denoising.")
     args = ap.parse_args()
     
     main(args)

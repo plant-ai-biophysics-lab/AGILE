@@ -1853,10 +1853,10 @@ class DDIMSamplerWithGrad(object):
 
             betas = kwargs['betas']
             
-            ### NOTE FOR DEBUGGING NOTE ###
-            timesteps_to_display = [49, 30, 20, 10, 0]
-            grid_images = np.zeros((1, len(timesteps_to_display), 3, 512, 512))  # 1 row, 6 columns, 3 channels, 512x512
-            ### NOTE FOR DEBUGGING NOTE ###
+            # ### NOTE FOR DEBUGGING NOTE ###
+            # timesteps_to_display = [49, 30, 20, 10, 0]
+            # grid_images = np.zeros((1, len(timesteps_to_display), 3, 512, 512))  # 1 row, 6 columns, 3 channels, 512x512
+            # ### NOTE FOR DEBUGGING NOTE ###
             
             # for opt_step in range(opt_steps):
             for i, step in enumerate(iterator):
@@ -1898,21 +1898,21 @@ class DDIMSamplerWithGrad(object):
                         intermediates['pred_x0'].append(pred_x0)
                         intermediates['attn_maps'].append({f"timestep_{index}": attn_maps})
                     
-                ### NOTE FOR DEBUGGING NOTE ###
-                # Check if `index` is in `timesteps_to_display`
-                if index in timesteps_to_display:
-                    timestep_index = timesteps_to_display.index(index)
-                    img_decoded = self.model.decode_first_stage(img)
-                    grid_images[:,timestep_index,:,:,:] = img_decoded.cpu()  # Store in prefilled grid for selected timesteps
+            #     ### NOTE FOR DEBUGGING NOTE ###
+            #     # Check if `index` is in `timesteps_to_display`
+            #     if index in timesteps_to_display:
+            #         timestep_index = timesteps_to_display.index(index)
+            #         img_decoded = self.model.decode_first_stage(img)
+            #         grid_images[:,timestep_index,:,:,:] = img_decoded.cpu()  # Store in prefilled grid for selected timesteps
 
-            ### NOTE FOR DEBUGGING NOTE ###
-            # Generate the image grid from the prefilled array for both normal images and prompt maps
+            # ### NOTE FOR DEBUGGING NOTE ###
+            # # Generate the image grid from the prefilled array for both normal images and prompt maps
             
-            # Save normal image grid
-            rgb_img_dir = os.path.join(kwargs['logs_dir'], 'rgb_images')
-            batch_idx = random.randint(0, 1000)
-            self.create_image_grid_prefilled(grid_images, len(timesteps_to_display), rgb_img_dir, timesteps_to_display, batch_idx)
-            #  ### NOTE FOR DEBUGGING NOTE ###
+            # # Save normal image grid
+            # rgb_img_dir = os.path.join(kwargs['logs_dir'], 'rgb_images')
+            # batch_idx = random.randint(0, 1000)
+            # self.create_image_grid_prefilled(grid_images, len(timesteps_to_display), rgb_img_dir, timesteps_to_display, batch_idx)
+            # #  ### NOTE FOR DEBUGGING NOTE ###
             
         else:
             kwargs['optimizing'] = True

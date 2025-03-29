@@ -770,6 +770,13 @@ class LatentDiffusion(DDPM):
         if bs is not None:
             x = x[:bs]
         x = x.to(self.device)
+        if x.ndim == 3:  
+            x = x.unsqueeze(0)  # Add batch dimension if missing
+        if x.shape[1] != 3:  
+            x = x.permute(0, 3, 1, 2)  # Convert (1, 512, 3, 512) → (1, 3, 512, 512)
+        if x.shape[-1] == 3:  # If shape is (1, 512, 512, 3), move channels to correct position
+            x = x.permute(0, 3, 1, 2)  # Converts (B, H, W, C) → (B, C, H, W)
+            
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 

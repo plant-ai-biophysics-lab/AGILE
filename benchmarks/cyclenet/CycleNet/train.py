@@ -1,5 +1,6 @@
 import os
 import argparse
+import torch
 import numpy as np
 
 from torch.utils.data import Dataset
@@ -67,21 +68,28 @@ class ControlNetDataset(Dataset):
         prompt = item['prompt']
 
         target_image_path = os.path.join(self.target_images_path, target_image_file)
-        
+
         # Load image
         target_image = Image.open(target_image_path).convert("RGB")
         
         # Apply transformations if any
         if self.transform:
             target_image = self.transform(target_image)
-        target_image = np.array(target_image).astype(np.float32) / 127.5 - 1.0
-            
+
+        target_image = np.array(target_image) / 127.5 - 1.0  # Normalize
+        
+        # Ensure shape is (C, H, W)
+        if target_image.shape[-1] == 3:  # (H, W, C)
+            target_image = np.transpose(target_image, (2, 0, 1))  # Convert to (C, H, W)
+
+        # Convert to PyTorch tensor explicitly
+        target_image = torch.tensor(target_image, dtype=torch.float16)
+
         return dict(
             jpg=target_image,
             txt=prompt,
             source=source_prompt,
         )
-
 if __name__ == "__main__":
     
     ap = argparse.ArgumentParser()
@@ -115,8 +123,9 @@ if __name__ == "__main__":
 
     # Define transformation and dataset
     transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        PermuteTransform()
+        transforms.Resize((args.image_size, args.image_size), transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),  # More efficient than manual numpy conversion
+        transforms.Lambda(lambda x: x.half()),  # Convert to float16
     ])
     dataset = ControlNetDataset(
         source_prompt=args.source_prompt,
@@ -125,7 +134,12 @@ if __name__ == "__main__":
         transform=transform,
         img_size=args.image_size,
     )
-    dataloader = DataLoader(dataset, num_workers=0, batch_size=batch_size_per_gpu, shuffle=True)
+    dataloader = DataLoader(dataset, 
+        num_workers=4,  # Use more workers for loading
+        pin_memory=True,  # Optimize memory transfer to GPU
+        persistent_workers=True, 
+        batch_size=batch_size_per_gpu, 
+        shuffle=True)
 
     logger = ImageLogger(batch_frequency=logger_freq, every_n_train_steps=logger_freq)
     logger.train_dataloader = dataloader
@@ -136,8 +150,7 @@ if __name__ == "__main__":
         max_epochs=args.epochs,
         accelerator="gpu",
         devices=args.gpus,
-        strategy="ddp" if args.gpus > 1 else None,
-        precision=32,
+        precision=16,
         callbacks=[logger],
         default_root_dir=args.logs_dir
     )

@@ -71,7 +71,7 @@ class YoloDataset(Dataset):
                     x_max = x_center + box_w / 2
                     y_max = y_center + box_h / 2
                     
-                    # of xmin or ymin is less than 5, add 1
+                    # if xmin or ymin is less than 5, add 1
                     if x_min < 5:
                         x_min += 1
                         x_max += 1
@@ -90,9 +90,7 @@ class YoloDataset(Dataset):
                         continue  # skip invalid box
 
                     boxes.append([x_min, y_min, x_max, y_max])
-
-                    # Shift class label by one if needed (torchvision expects class 0 for background)
-                    labels.append(int(cls) + 1)
+                    labels.append(int(cls) + 1)  # shift class label by one if needed
 
         if self.transform:
             transformed = self.transform(image=np.array(image), bboxes=boxes, labels=labels)
@@ -108,7 +106,6 @@ class YoloDataset(Dataset):
             boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
             labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
 
-        # Create target dict
         target = {
             "boxes": boxes_tensor,
             "labels": labels_tensor
@@ -141,13 +138,9 @@ def draw_boxes(image_np, boxes, labels, scores=None, box_color=(0, 255, 0), thic
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
     return image_np
 
-def prepare_symlink(
-    save: Path,
-    symlink_temp: str,
-) -> None:
-    
+def prepare_symlink(save: Path, symlink_temp: str) -> None:
     if not (save / symlink_temp).exists():
-            os.makedirs(save / symlink_temp)
+        os.makedirs(save / symlink_temp)
     if not (save / symlink_temp / 'images').exists():
         os.makedirs(save / symlink_temp / 'images')
     if not (save / symlink_temp / 'images/train').exists():
@@ -175,14 +168,14 @@ def create_symlink(source: Path, target: Path) -> None:
             item_target = target / item.name
             if item_target.exists():
                 if item_target.is_symlink():
-                    item_target.unlink()  # Remove the existing symlink
+                    item_target.unlink()
                 else:
                     raise FileExistsError(f"Target path {item_target} exists and is not a symlink.")
             os.symlink(item, item_target)
     else:
         if target.exists():
             if target.is_symlink():
-                target.unlink()  # Remove the existing symlink
+                target.unlink()
             else:
                 raise FileExistsError(f"Target path {target} exists and is not a symlink.")
         os.symlink(source, target)
@@ -200,8 +193,6 @@ def filter_outputs(outputs, score_threshold=0.3, iou_threshold=0.3):
         Filtered outputs after applying score threshold and NMS.
     """
     filtered_outputs = []
-    
-    # Ensure outputs is a list
     return_as_list = True
     if not isinstance(outputs, list):
         outputs = [outputs]
@@ -209,8 +200,6 @@ def filter_outputs(outputs, score_threshold=0.3, iou_threshold=0.3):
 
     for output in outputs:
         scores = output["scores"]
-
-        # Step 1: Filter by confidence score
         keep_indices = scores > score_threshold
         boxes = output["boxes"][keep_indices]
         scores = output["scores"][keep_indices]
@@ -220,15 +209,12 @@ def filter_outputs(outputs, score_threshold=0.3, iou_threshold=0.3):
             filtered_outputs.append({"boxes": [], "labels": [], "scores": []})
             continue
 
-        # Step 2: Apply Non-Maximum Suppression (NMS) using torchvision
         nms_indices = ops.nms(boxes, scores, iou_threshold)
-
         filtered_output = {
             "boxes": boxes[nms_indices],
             "labels": labels[nms_indices],
             "scores": scores[nms_indices]
         }
-
         filtered_outputs.append(filtered_output)
     
     return filtered_outputs if return_as_list else filtered_outputs[0]
@@ -245,17 +231,18 @@ def main(
     normal_augs: bool,
     lr: float,
     momentum: float,
-    weight_decay: float
+    weight_decay: float,
+    k_target: int  # new parameter for number of target samples to include or use
 ):
-    # get train, val and test images/labels
+    # Determine source and target subset directories
     path_source_train = source_images / 'train' if (source_images / 'train').exists() else source_images
     path_target_val = target_images / 'val' if (target_images / 'val').exists() else target_images
     path_target_test = target_images / 'test' if (target_images / 'test').exists() else target_images
 
-    # prepare symlink library
+    # Prepare symlink library
     prepare_symlink(save, symlink_temp)
 
-    # symlink images and labels
+    # Symlink images and labels for training, validation, and test sets.
     if generated_images:
         create_symlink(generated_images, save / symlink_temp / 'images/train')
     else:
@@ -265,6 +252,59 @@ def main(
     create_symlink(path_target_val / 'labels', save / symlink_temp / 'labels/val')
     create_symlink(path_target_test / 'images', save / symlink_temp / 'images/test')
     create_symlink(path_target_test / 'labels', save / symlink_temp / 'labels/test')
+
+    # If generated images are provided, include k target images from the target set.
+    if generated_images and k_target > 0:
+        if (target_images / 'train').exists():
+            target_train = target_images / 'train'
+        elif (target_images / 'images').exists() and (target_images / 'labels').exists():
+            target_train = target_images
+        else:
+            target_train = None
+            print("Warning: Target training images not found in expected structure. Skipping addition of target images.")
+        
+        if target_train is not None:
+            if (target_train / 'images').exists():
+                target_train_images = target_train / 'images'
+            else:
+                target_train_images = target_train
+            if (target_train / 'labels').exists():
+                target_train_labels = target_train / 'labels'
+            else:
+                target_train_labels = target_train
+            target_image_files = sorted([f for f in os.listdir(target_train_images) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+            if len(target_image_files) == 0:
+                print("No images found in target training directory.")
+            else:
+                k = min(k_target, len(target_image_files))
+                sampled_files = random.sample(target_image_files, k)
+                for file in sampled_files:
+                    src_image = target_train_images / file
+                    dst_image = save / symlink_temp / 'images/train' / file
+                    if not dst_image.exists():
+                        os.symlink(src_image, dst_image)
+                    label_file = os.path.splitext(file)[0] + ".txt"
+                    src_label = target_train_labels / label_file
+                    dst_label = save / symlink_temp / 'labels/train' / label_file
+                    if os.path.exists(src_label) and not dst_label.exists():
+                        os.symlink(src_label, dst_label)
+
+    # New behavior: if generated images are NOT provided but k_target is specified,
+    # then prune the training set to only use k_target random samples.
+    if not generated_images and k_target > 0:
+        print("Pruning training set to include only k_target samples...")
+        train_images_dir = save / symlink_temp / 'images/train'
+        train_labels_dir = save / symlink_temp / 'labels/train'
+        train_files = sorted([f for f in os.listdir(train_images_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+        if len(train_files) > k_target:
+            sampled_files = random.sample(train_files, k_target)
+            for f in train_files:
+                if f not in sampled_files:
+                    os.remove(train_images_dir / f)
+                    label_file = os.path.splitext(f)[0] + ".txt"
+                    label_path = train_labels_dir / label_file
+                    if os.path.exists(label_path):
+                        os.remove(label_path)
 
     train_image_dir = save / symlink_temp / "images/train"
     train_label_dir = save / symlink_temp / "labels/train"
@@ -282,12 +322,12 @@ def main(
     transform_test = A.Compose([
         A.Resize(height=orig_height, width=orig_width, p=1.0),
         A.PadIfNeeded(
-                min_height=orig_height, 
-                min_width=orig_height, 
-                border_mode=cv2.BORDER_CONSTANT, 
-                value=0,
-                p=1.0
-            ),
+            min_height=orig_height, 
+            min_width=orig_height, 
+            border_mode=cv2.BORDER_CONSTANT, 
+            value=0,
+            p=1.0
+        ),
         A.Resize(height=image_size, width=image_size, p=1.0),
         ToTensorV2()
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
@@ -297,12 +337,14 @@ def main(
     else:
         transform_train = A.Compose([
             A.OneOf([
-                A.RandomResizedCrop(height=orig_height, width=orig_width, scale=(0.4, 0.8), ratio=(0.9, 1.1), p=0.5),  # random crop (zoom in)
-                A.PadIfNeeded(min_height=int(gen_height * 1.3), min_width=int(gen_width * 1.3), border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),  # shrink (zoom out)
+                A.RandomResizedCrop(size=(orig_height, orig_width), scale=(0.4, 0.8), ratio=(0.9, 1.1), p=0.5),
+                A.PadIfNeeded(min_height=int(gen_height * 1.3), min_width=int(gen_width * 1.3),
+                            border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),
             ], p=1.0),
-            A.Resize(height=orig_height, width=orig_width, p=1.0), # maintain aspect ratio
-            A.PadIfNeeded(min_height=orig_height, min_width=orig_height, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0), # square
-            A.Resize(height=image_size, width=image_size, p=1.0), # resize for model input
+            A.Resize(height=orig_height, width=orig_width, p=1.0),
+            A.PadIfNeeded(min_height=orig_height, min_width=orig_height,
+                        border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
+            A.Resize(height=image_size, width=image_size, p=1.0),
             ToTensorV2()
         ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
         
@@ -316,8 +358,8 @@ def main(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Using a pretrained Faster R-CNN. Adjust num_classes as needed (including background)
-    num_classes = 2  # e.g., 1 object class + background; adjust if you have more classes.
+    # Setup pretrained Faster R-CNN with adjusted number of classes
+    num_classes = 2  # e.g., 1 object class + background; adjust if more classes
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
@@ -335,13 +377,11 @@ def main(
     for epoch in tqdm(range(epochs)):
         model.train()
         running_loss = 0.0
-        for images, targets in train_loader:
-            
+        for images, targets in tqdm(train_loader):
             valid_samples = [(img, tgt) for img, tgt in zip(images, targets) if tgt["boxes"].numel() > 0]
             if len(valid_samples) == 0:
                 continue
             images, targets = zip(*valid_samples)
-            
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -356,9 +396,7 @@ def main(
         avg_loss = running_loss / len(train_loader)
         print(f"Epoch [{epoch+1}/{epochs}], Training Loss: {avg_loss:.4f}")
 
-        # -------------------------
         # Evaluate on Validation Set
-        # -------------------------
         print("Evaluating on validation set...")
         model.eval()
         all_preds = []
@@ -367,10 +405,7 @@ def main(
             for images, targets in tqdm(val_loader):
                 images = [img.to(device) for img in images]
                 outputs = model(images)
-                
-                # keep only predictions with score > 0.3
                 outputs = filter_outputs(outputs)
-                
                 for i in range(len(images)):
                     gt = {
                         "boxes": targets[i]["boxes"].cpu(),
@@ -406,16 +441,12 @@ def main(
             }, best_checkpoint_path)
             print(f"✅ Best model updated! Saved at {best_checkpoint_path}")
 
-        # Log metrics for current epoch (test mAP is logged only for final epoch)
         epoch_metrics = {
             "epoch": epoch+1,
             "train_loss": avg_loss,
             "val_mAP": mAP_value
         }
 
-        # -------------------------
-        # If final epoch, evaluate test set and save predictions
-        # -------------------------
         if epoch == epochs - 1:
             print("Loading best checkpoint for final evaluation...")
             best_checkpoint_path = save / "checkpoints/best_model.pth"
@@ -435,10 +466,7 @@ def main(
                 for images, targets in tqdm(test_loader):
                     images = [img.to(device) for img in images]
                     outputs = model(images)
-                    
-                    # keep only predictions with score > 0.3
                     outputs = filter_outputs(outputs)
-                
                     for i in range(len(images)):
                         gt_test = {
                             "boxes": targets[i]["boxes"].cpu(),
@@ -507,17 +535,11 @@ def main(
 
         metrics_history.append(epoch_metrics)
 
-    # -------------------------
-    # Save Metrics to CSV
-    # -------------------------
     os.makedirs(f"{save}/results", exist_ok=True)
     df = pd.DataFrame(metrics_history)
     df.to_csv(f"{save}/results/metrics.csv", index=False)
     print("Results saved to results/metrics.csv")
 
-    # -------------------------
-    # Save Groundtruth Labels Plotted on Train Set Images
-    # -------------------------
     sample_indices_train = random.sample(range(len(train_dataset)), min(5, len(train_dataset)))
     os.makedirs(f"{save}/results/train_groundtruth_samples", exist_ok=True)
     for idx in sample_indices_train:
@@ -535,12 +557,11 @@ def main(
         shutil.rmtree(save / symlink_temp)
 
 if __name__ == '__main__':
-    
     ap = argparse.ArgumentParser()
     ap.add_argument('--source-images', type=Path, required=True,
                     help='Path to training and validation dataset')
     ap.add_argument('--target-images', type=Path, required=True,
-                    help='Path to training and validation dataset')
+                    help='Path to target dataset')
     ap.add_argument('--generated-images', type=Path, required=False, default=None,
                     help='Path to generated images')
     ap.add_argument('--save', type=Path, required=True,
@@ -552,7 +573,7 @@ if __name__ == '__main__':
     ap.add_argument('--batch-size', type=int, default=16,
                     help='Batch size per epoch.')
     ap.add_argument('--symlink-temp', type=str, default='temp',
-                    help='Name of the run.')
+                    help='Name of the temporary symlink directory.')
     ap.add_argument('--run-name', type=str, default='temp',
                     help='Name of the run.')
     ap.add_argument('--normal-augs', action='store_true',
@@ -563,16 +584,18 @@ if __name__ == '__main__':
                     help='Momentum for training.')
     ap.add_argument('--weight-decay', type=float, default=0.0005,
                     help='Weight decay for training.')
+    ap.add_argument('--k-target', type=int, default=0,
+                    help='Number of target images to include in training if generated images is provided. '
+                         'If generated images are not provided, only k samples from the source training set will be used.')
     args = ap.parse_args()
     
     save = args.save / args.run_name
     
-    # save arguments to a file
     os.makedirs(save, exist_ok=True)
     with open(save / 'args.txt', 'w') as f:
         f.write(str(args))
 
-    main(args.source_images, args.target_images, args.generated_images, \
-            save, args.image_size, args.epochs, args.batch_size, \
-                args.symlink_temp, args.normal_augs, args.lr, \
-                    args.momentum, args.weight_decay)
+    main(args.source_images, args.target_images, args.generated_images,
+         save, args.image_size, args.epochs, args.batch_size,
+         args.symlink_temp, args.normal_augs, args.lr,
+         args.momentum, args.weight_decay, args.k_target)

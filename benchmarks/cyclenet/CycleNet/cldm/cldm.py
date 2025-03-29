@@ -284,6 +284,13 @@ class ControlNet(nn.Module):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
+        if hint.ndim == 3:  
+            hint = hint.unsqueeze(0)  # Add batch dimension if missing
+        if hint.shape[1] != 3:  
+            hint = hint.permute(0, 3, 1, 2)  # Convert (1, 512, 3, 512) → (1, 3, 512, 512)
+        if hint.shape[-1] == 3:  # If shape is (1, 512, 512, 3), move channels to correct position
+            hint = hint.permute(0, 3, 1, 2)  # Converts (B, H, W, C) → (B, C, H, W)
+            
         guided_hint = self.input_hint_block(hint, emb, context)
 
         outs = []

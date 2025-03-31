@@ -3,6 +3,8 @@
 
 arxiv: https://arxiv.org/abs/2503.22019
 
+![Overview](assets/semantic.png)
+
 ## 1. Prepare pretrained weights
 
 Go to official ControlNet repository to obtain pretrained ControlNet weights: https://github.com/lllyasviel/ControlNet/blob/main/docs/train.md

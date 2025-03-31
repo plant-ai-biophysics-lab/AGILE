@@ -1,9 +1,13 @@
 # AGILE
 **A**ttention-**G**uided **I**mage and **L**abel Translation for **E**fficient Cross-Domain Plant Trait Identification
 
+arxiv: https://arxiv.org/abs/2503.22019
+
 ## 1. Prepare pretrained weights
 
-Go to official ControlNet repository to obtain pretrained weights: https://github.com/lllyasviel/ControlNet/blob/main/docs/train.md
+Go to official ControlNet repository to obtain pretrained ControlNet weights: https://github.com/lllyasviel/ControlNet/blob/main/docs/train.md
+
+Save your checkpoint here: `checkpoints/`
 
 ## 2. Create a new conda environment
 
@@ -12,14 +16,28 @@ conda env create -n agile python=3.10
 pip install -r requirements.txt
 ```
 
-## 3. Run Text Optimization
+## 3. Setup example dataset and checkpoints
 
-Edit these lines in `scripts/run_optimize.sh`:
+You can download the dataset from [AgML](https://github.com/Project-AgML/AgML).
 
-```
-CHECKPOINT="./control_sd15_ini.ckpt"  # Path to pretrained model
-RUN_NAME="INSERT-CUSTOM-RUNNAME-HERE"
-LOGS_DIR="../$RUN_NAME"  # Directory to save logs
-```
+Here are the recommended datasets to get started:
+- Synthetic: `grape_detection_syntheticday`
+- Real: `grape_detection_californiaday`
 
-Change `CHECKPOINT` to the path where the pretrained weights are in step 1.
+To download and setup this dataset, use the notebook in `setup/install_dataset.ipynb`
+
+## 3. Run text optimization
+
+To run text optimization, run this bash script: `scripts/run_optimize.sh`
+
+Feel free to edit any script inputs if you are using a custom dataset.
+
+## 4. Run attention guidance
+
+Take the path of your optimized prompt embeddings from Step 3 from your logs directory in `text_optimizer/optimized_embeddings.pt` and input it in `PROMPT_EMBEDDING` within the script: `scripts/run_control.sh`.
+
+Run image generation with attention guidance with: `scripts/run_control.sh`
+
+## 5. Using custom checkpoints
+
+To skip model fine-tuning within Step 3 and Step 4, add the `--subset` flag in each python call and change the `CHECKPOINT` input to point at the custom checkpoints.

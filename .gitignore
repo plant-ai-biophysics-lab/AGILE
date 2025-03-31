@@ -5,3 +5,5 @@ farm
 /scripts/controlnet/src/__pycache__/*
 /scripts/controlnetplus/src/__pycache__/*
 benchmarks/cyclegan_turbo/wandb/*
+datasets/*
+checkpoints/*

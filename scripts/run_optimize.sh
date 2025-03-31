@@ -3,46 +3,45 @@
 CURRENT_PATH=$(pwd)/../
 
 # Define the arguments
-CHECKPOINT="/data2/eranario/intermediate_data/AGILE/control_sd15_ini.ckpt"  # Path to pretrained model
+DATA="grape"
+TRANSFER="syn2day"
+CHECKPOINT="checkpoints/control_sd15_ini.ckpt"  # Path to pretrained model
 MODEL_CONFIG="$CURRENT_PATH/models/cldm_v15.yaml"  # Path to model config file
-SD_LOCKED=true  # Stable diffusion decoder locked 
-ONLY_MID_CONTROL=false  # Only mid control of ControlNet
-SOURCE_IMAGES_PATH="/data2/eranario/data/AGILE-Datasets/Grape-Detection/Synthetic/images"  # Path to source images
-TARGET_IMAGES_PATH="/data2/eranario/data/AGILE-Datasets/Grape-Detection/BordenDayRow/train/images"  # Path to target images
+SOURCE_IMAGES_PATH="/group/jmearlesgrp/scratch/eranario/AGILE/datasets/grape_detection_syntheticday/reformatted/train/images"  # Path to source images
+TARGET_IMAGES_PATH="/group/jmearlesgrp/scratch/eranario/AGILE/datasets/grape_detection_californiaday/reformatted/train/images"  # Path to target images
 BATCH_SIZE=1  # Batch size for training
 IMAGE_SIZE=512  # Input image size
-EPOCHS=10  # Number of epochs for training
+EPOCHS=30  # Number of epochs for training
 PARAM="eps"  # Parameterization for loss
 OPTIMIZE_EMBEDDINGS=true  # Optimize embeddings
 PROMPT="grape"  # Prompt for text embeddings
 OPTIMIZE_EPOCHS=1  # Number of epochs for optimizing embeddings
 OPTIMIZE_STEPS=50  # Number of optimization steps
-SPREAD_FACTOR=4.0  # Spread factor for Gaussian map
-CONTROL_STRENGTH=5.0  # Control strength for ControlNet
-LR=0.0001  # Learning rate
+SPREAD_FACTOR=2.0  # Spread factor for Gaussian map
+CONTROL_STRENGTH=1.0  # Control strength for ControlNet
+UGS=5.0  # UGS value for ControlNet
 
 # Make logs directory
-RUN_NAME="1221_OPTIMIZE_TS-49"
-LOGS_DIR="/data2/eranario/intermediate_data/AGILE/borden_syn2day/$RUN_NAME"  # Directory to save logs
+RUN_NAME="OPTIMIZE_${DATA}_${TRANSFER}_strength-${CONTROL_STRENGTH}_ugs-${UGS}_sf-${SPREAD_FACTOR}_${DESCRIPTION}"
+LOGS_DIR="logs/$RUN_NAME"  # Directory to save logs
 mkdir -p $LOGS_DIR
 
 # Run the Python script with the arguments
 python3 $CURRENT_PATH/main.py \
-  --checkpoint "$CHECKPOINT" \
-  --model_config "$MODEL_CONFIG" \
-  $( [ "$SD_LOCKED" = true ] && echo "--sd_locked" ) \
-  --only_mid_control "$ONLY_MID_CONTROL" \
-  --source_images_path "$SOURCE_IMAGES_PATH" \
-  --target_images_path "$TARGET_IMAGES_PATH" \
-  --batch_size "$BATCH_SIZE" \
-  --image_size "$IMAGE_SIZE" \
-  --epochs "$EPOCHS" \
-  --logs_dir "$LOGS_DIR" \
-  --param "$PARAM" \
-  $( [ "$OPTIMIZE_EMBEDDINGS" = true ] && echo "--optimize_embeddings" ) \
+  --model_config $MODEL_CONFIG \
+  --checkpoint $CHECKPOINT \
+  --source_images_path $SOURCE_IMAGES_PATH \
+  --target_images_path $TARGET_IMAGES_PATH \
+  --epochs $EPOCHS \
+  --batch_size $BATCH_SIZE \
+  --logs_dir $LOGS_DIR \
+  --optimize_embeddings \
+  --optimize_epochs $OPTIMIZE_EPOCHS \
+  --optimize_steps $OPTIMIZE_STEPS \
+  --image_size $IMAGE_SIZE \
   --prompt "$PROMPT" \
-  --lr "$LR" \
-  --control_strength "$CONTROL_STRENGTH" \
-  --optimize_epochs "$OPTIMIZE_EPOCHS" \
-  --optimize_steps "$OPTIMIZE_STEPS" \
-  --spread_factor "$SPREAD_FACTOR"
+  --spread_factor $SPREAD_FACTOR \
+  --timestep $TIMESTEP \
+  --control_strength $CONTROL_STRENGTH \
+  --unconditional_guidance_scale $UGS \
+  # --subset

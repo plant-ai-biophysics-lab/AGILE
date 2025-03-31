@@ -1,9 +1,8 @@
 # AGILE
 **A**ttention-**G**uided **I**mage and **L**abel Translation for **E**fficient Cross-Domain Plant Trait Identification
 
-arxiv: https://arxiv.org/abs/2503.22019
-
 ![Overview](assets/semantic.png)
+<a href="https://arxiv.org/abs/2503.22019"><img src="https://img.shields.io/badge/arXiv-2503.22019-b31b1b.svg" height=22.5></a>
 
 ## 1. Prepare pretrained weights
 

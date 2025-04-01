@@ -3,6 +3,7 @@
 
 ![Overview](assets/semantic.png)
 <a href="https://arxiv.org/abs/2503.22019"><img src="https://img.shields.io/badge/arXiv-2503.22019-b31b1b.svg" height=22.5></a>
+<a href="https://huggingface.co/papers/2503.22019"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Papers-blue" alt="Hugging Face Papers" height="22.5"></a>
 
 ## 1. Prepare pretrained weights
 

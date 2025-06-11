@@ -44,7 +44,7 @@ class ImageLogger(Callback):
             Image.fromarray(grid).save(path)
 
     def log_img(self, pl_module, batch, batch_idx, split="train", save_dir="image_log"):
-        check_idx = pl_module.current_epoch  # if self.log_on_batch_idx else pl_module.global_step
+        check_idx = pl_module.global_step  # if self.log_on_batch_idx else pl_module.global_step
         if (self.check_frequency(check_idx, batch_idx) and  # batch_idx % self.batch_freq == 0
                 hasattr(pl_module, "log_images") and
                 callable(pl_module.log_images) and
@@ -93,7 +93,8 @@ class ImageLogger(Callback):
                 pl_module.train()
 
     def check_frequency(self, check_idx, batch_idx):
-        return batch_idx == 0 and check_idx % self.epoch_freq == 0
+        # return batch_idx == 0 and check_idx % self.epoch_freq == 0
+        return check_idx % 2000 == 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if not self.disabled:

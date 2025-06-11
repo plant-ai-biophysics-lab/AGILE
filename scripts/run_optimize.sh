@@ -13,13 +13,13 @@ BATCH_SIZE=1  # Batch size for training
 IMAGE_SIZE=512  # Input image size
 EPOCHS=30  # Number of epochs for training
 PARAM="eps"  # Parameterization for loss
-OPTIMIZE_EMBEDDINGS=true  # Optimize embeddings
 PROMPT="grape"  # Prompt for text embeddings
 OPTIMIZE_EPOCHS=1  # Number of epochs for optimizing embeddings
 OPTIMIZE_STEPS=50  # Number of optimization steps
 SPREAD_FACTOR=2.0  # Spread factor for Gaussian map
 CONTROL_STRENGTH=1.0  # Control strength for ControlNet
 UGS=5.0  # UGS value for ControlNet
+TIMESTEP="30" # Timestep for optimization
 
 # Make logs directory
 RUN_NAME="OPTIMIZE_${DATA}_${TRANSFER}_strength-${CONTROL_STRENGTH}_ugs-${UGS}_sf-${SPREAD_FACTOR}_${DESCRIPTION}"

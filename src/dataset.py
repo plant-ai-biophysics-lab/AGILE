@@ -11,7 +11,7 @@ from PIL import Image
 
 class ControlNetDataset(Dataset):
     def __init__(
-        self, source_images_path, target_images_path, prompt, transform=None, optimizing=False, 
+        self, source_images_path, target_images_path, prompt, transform=None, optimizing=False,
         spread_factor=4.0, betas=None, generated=None, img_size=512, use_transforms=False, apply_bbox_mask=False,
         device="cuda"
     ):
@@ -41,7 +41,8 @@ class ControlNetDataset(Dataset):
             self.target_image_files = [f for f in os.listdir(target_images_path) if f.endswith(('jpg', 'jpeg', 'png'))]
         
         # Balance the dataset lengths
-        self.balance_dataset_lengths(method="oversample")
+        # self.balance_dataset_lengths(method="undersample")
+        print(f"Source images: {len(self.source_image_files)}, Target images: {len(self.target_image_files)}")
         
         # Create dataset structure
         self.data = []

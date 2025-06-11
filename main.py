@@ -99,15 +99,24 @@ def main(args):
         logger.train_dataloader = dataloader
         
         # start training
-        trainer = pl.Trainer(
-            max_epochs=args.epochs,
-            default_root_dir=args.logs_dir,
-            precision = 32,
-            callbacks = [logger],
-            accumulate_grad_batches=args.batch_size*4
-        )
+        trainer_args = {
+            "default_root_dir": args.logs_dir,
+            "precision": 32,
+            "callbacks": [logger],
+            "accumulate_grad_batches": args.batch_size * 4
+        }
+        
+        if args.epochs is not None:
+            trainer_args["max_epochs"] = args.epochs
+        elif args.max_train_steps is not None:
+            trainer_args["max_steps"] = args.max_train_steps
+        else:
+            print("Using default max_epochs of 5")
+            trainer_args["max_epochs"] = 5
+            
+        trainer = pl.Trainer(**trainer_args)
         trainer.fit(model, dataloader)
-    
+
     #######################################################
     ############### EMBEDDING OPTIMIZATION ################
     #######################################################
@@ -235,7 +244,7 @@ if __name__ == "__main__":
                     help="Input image size.")
     ap.add_argument("--logger_freq", type=int, default=1,
                     help="Logging frequency.")
-    ap.add_argument("--epochs", type=int, default=100,
+    ap.add_argument("--epochs", type=int, default=None,
                     help="Number of epochs for training.")
     ap.add_argument("--logs_dir", type=Path, default="logs",
                     help="Directory to save logs.")
@@ -275,6 +284,8 @@ if __name__ == "__main__":
                     help="If set, mask bounding box will be used.")
     ap.add_argument("--stop_editing", type=int, default=5,
                     help="Stop editing at the timestep for denoising.")
+    ap.add_argument("--max_train_steps", type=int, default=None,
+                    help="Maximum training steps.")
     args = ap.parse_args()
     
     main(args)
